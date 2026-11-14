@@ -89,7 +89,15 @@
         meeting_id  TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
         label       TEXT NOT NULL,
         name        TEXT,
-        PRIMARY KEY (meeting_id, label))"))
+        PRIMARY KEY (meeting_id, label))")
+    (2
+     "CREATE TABLE relay_imports (
+        remote_id   TEXT PRIMARY KEY,
+        meeting_id  TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+        relay_url   TEXT NOT NULL,
+        profile     TEXT NOT NULL,
+        imported_at INTEGER NOT NULL,
+        acked_at    INTEGER)"))
   "Schema migrations as (VERSION SQL...) in ascending order.
 Each entry upgrades the schema from VERSION - 1 to VERSION.  The
 current version lives in PRAGMA user_version.  Never edit a released
@@ -165,6 +173,17 @@ entry; append a new one instead.")
     (unless (string-match-p "\\`[a-z_]+\\'" name)
       (error "Invalid column name %S" key))
     name))
+
+(defmacro muesli-db-with-transaction (&rest body)
+  "Run BODY inside a database transaction, rolling back on error."
+  (declare (indent 0) (debug t))
+  (let ((db (make-symbol "db")))
+    `(let ((,db (muesli-db)))
+       (sqlite-transaction ,db)
+       (condition-case err
+           (prog1 (progn ,@body) (sqlite-commit ,db))
+         (error (sqlite-rollback ,db)
+                (signal (car err) (cdr err)))))))
 
 ;;;; Meetings
 
@@ -334,6 +353,31 @@ NAME is used only when the speaker is new or has no name yet."
   "Return all distinct speaker names used in past meetings."
   (mapcar #'car (sqlite-select (muesli-db)
                                "SELECT DISTINCT name FROM speakers WHERE name IS NOT NULL ORDER BY name")))
+
+;;;; Relay imports
+
+(defun muesli-db-relay-import-add (remote-id meeting-id relay-url profile)
+  "Record that relay recording REMOTE-ID became meeting MEETING-ID.
+RELAY-URL is the relay it came from and PROFILE the profile used."
+  (muesli-db--execute
+   "INSERT INTO relay_imports (remote_id, meeting_id, relay_url, profile, imported_at)
+    VALUES (?, ?, ?, ?, ?)"
+   (list remote-id meeting-id relay-url profile (truncate (float-time)))))
+
+(defun muesli-db-relay-import (remote-id)
+  "Return the import row of relay recording REMOTE-ID, or nil."
+  (car (muesli-db--select "SELECT * FROM relay_imports WHERE remote_id = ?"
+                          (list remote-id))))
+
+(defun muesli-db-relay-import-for-meeting (meeting-id)
+  "Return the import row that created MEETING-ID, or nil."
+  (car (muesli-db--select "SELECT * FROM relay_imports WHERE meeting_id = ?"
+                          (list meeting-id))))
+
+(defun muesli-db-relay-import-mark-acked (remote-id)
+  "Note that the relay confirmed delivery of REMOTE-ID."
+  (muesli-db--execute "UPDATE relay_imports SET acked_at = ? WHERE remote_id = ?"
+                      (list (truncate (float-time)) remote-id)))
 
 (provide 'muesli-db)
 ;;; muesli-db.el ends here

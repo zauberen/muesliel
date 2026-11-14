@@ -1,0 +1,29 @@
+;; muesli-relay configuration.  Every value can be overridden with the
+;; environment variable named next to it.  Point RELAY_CONFIG at another
+;; EDN file to replace this one entirely.
+{:http {:host #or [#env RELAY_HOST "127.0.0.1"]
+        :port #long #or [#env RELAY_PORT 8787]}
+
+ ;; Public URL the phone uses.  An https:// URL turns on Secure cookies.
+ :base-url #or [#env RELAY_BASE_URL "http://localhost:8787"]
+
+ ;; Trust X-Forwarded-Proto / X-Forwarded-For from a reverse proxy.
+ :behind-proxy #boolean #or [#env RELAY_BEHIND_PROXY "false"]
+
+ :db {:file #or [#env RELAY_DB "data/relay.sqlite"]}
+
+ :storage {:dir #or [#env RELAY_STORAGE "data/audio"]
+           :max-part-bytes 4194304          ; 4 MiB per 5 s slice is plenty
+           :max-recording-bytes 1073741824} ; 1 GiB
+
+ ;; Cookie encryption secret.  When unset, a random one is generated and
+ ;; kept in <data dir>/session.key so sessions survive restarts.
+ :session {:secret #env RELAY_SESSION_SECRET
+           :max-age-days 30}
+
+ :signup-enabled #boolean #or [#env RELAY_SIGNUP "false"]
+
+ :retention {:after-ack-hours 0
+             :abandon-after-hours 24
+             :purge-abandoned-days 14
+             :sweep-minutes 10}}

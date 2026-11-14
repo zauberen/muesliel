@@ -1,0 +1,16 @@
+;; PWA build.  `npx shadow-cljs release app sw` writes
+;; resources/public/js/main.js and resources/public/sw.js.
+{:source-paths ["src"]
+ :dependencies []
+ :builds
+ {:app {:target :browser
+        :output-dir "resources/public/js"
+        :asset-path "/js"
+        :modules {:main {:init-fn muesli.pwa.core/init}}
+        :release {:compiler-options {:optimizations :advanced}}}
+  :sw {:target :browser
+       :output-dir "resources/public"
+       :asset-path "/"
+       :modules {:sw {:init-fn muesli.pwa.sw/init
+                      :web-worker true}}
+       :release {:compiler-options {:optimizations :advanced}}}}}

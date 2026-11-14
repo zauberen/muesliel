@@ -1,6 +1,6 @@
 # muesli-relay — Spec 2: record on a phone, hand off to Emacs
 
-Status: draft · 2026-11-13
+Status: v1 implemented (relay/, muesli-relay.el) · 2026-11-13
 
 ## 1. Summary
 
@@ -119,11 +119,11 @@ Emacs config. The relay knows only the names of the setups Emacs offers.
 | Concern | Choice | Why |
 |---|---|---|
 | Build | `deps.edn` + `tools.build` (uberjar) | Standard and small. |
-| HTTP server | `ring-jetty9-adapter` | Streams large request and response bodies without buffering them. |
-| Routing | `reitit` (ring + malli coercion) | Data-driven routes with schema validation in one place. |
-| Validation | `malli` | Shared schemas for API requests and responses. |
+| HTTP server | `ring-jetty-adapter` (Jetty 11) | Streams large request and response bodies without buffering them. |
+| Routing | `reitit-ring` | Data-driven routes; middleware attached per route group. |
+| Validation | `malli` (`m/validate` + `me/humanize` in `muesli.relay.http/read-json`) | Shared schemas for request bodies, readable 422 errors. |
 | DB | SQLite via `next.jdbc` + `xerial/sqlite-jdbc` | Matches muesli's own choice. One file, easy to self-host. Postgres is an easy later swap. |
-| Migrations | `migratus` | Plain SQL files, append-only (same rule as `muesli-db--migrations`). |
+| Migrations | A vector of `[version statements]` in `db.clj`, version in `PRAGMA user_version` | Exactly the scheme of `muesli-db--migrations`; no extra dependency. |
 | Lifecycle | `integrant` | Explicit system map for the DB, server, sweeper and config. |
 | Config | `aero` (`resources/config.edn`, env overrides) | |
 | Passwords | `buddy-hashers` (argon2id) | |
@@ -131,33 +131,34 @@ Emacs config. The relay knows only the names of the setups Emacs offers.
 | HTML | `hiccup2` server-rendered pages for login, keys and clients | No SPA needed for account management. |
 | PWA | ClojureScript via `shadow-cljs`, no UI framework (direct DOM interop), service worker written in CLJS too | Keeps the whole thing in Clojure. The recorder is a single screen. |
 | Logging | `clojure.tools.logging` + logback | |
-| Tests | `clojure.test` + `kaocha`, `ring-mock`, a throwaway SQLite per test | |
+| Tests | `clojure.test` + `ring-mock`, a throwaway SQLite per test; `e2e/run.sh` drives Chrome + Emacs | |
 
 ### 4.2 Project layout
 
 ```
 relay/
-  deps.edn  shadow-cljs.edn  build.clj
+  deps.edn  shadow-cljs.edn  build.clj  package.json
   resources/
-    config.edn
-    migrations/001-init.up.sql ...
-    public/manifest.webmanifest  public/icons/...
+    config.edn  logback.xml
+    public/style.css  site.js  manifest.webmanifest  icons/
   src/muesli/relay/
-    main.clj          ; -main, integrant init, CLI dispatch
-    system.clj        ; integrant keys
-    config.clj
-    db.clj            ; next.jdbc datasource, queries
-    auth.clj          ; passwords, sessions, api-key lookup middleware
-    keys.clj          ; key generation/hashing
+    main.clj          ; -main, integrant system, user CLI
+    config.clj        ; aero config, session key
+    db.clj            ; schema/migrations (PRAGMA user_version), queries
+    http.clj          ; JSON + malli body helpers
+    keys.clj          ; API key generation/hashing
+    auth.clj          ; passwords, rate limit, api-key/session middleware
     storage.clj       ; part files on disk, assembly, deletion
-    api/client.clj    ; Emacs-facing routes (/api/v1/client/...)
+    recordings.clj    ; recording lifecycle shared by all routes
+    handler.clj       ; router, sessions, CSRF, CSP, static files
+    api/client.clj    ; Emacs-facing routes (/api/v1/client/...), Range
     api/app.clj       ; PWA-facing JSON routes (/app/api/...)
     web/pages.clj     ; hiccup pages
     sweeper.clj       ; retention + abandoned-recording cleanup
-    cli.clj           ; user add / passwd / disable / list
   src/muesli/pwa/
-    core.cljs  recorder.cljs  queue.cljs  idb.cljs  sw.cljs
-  test/...
+    core.cljs  recorder.cljs  queue.cljs  idb.cljs  api.cljs  sw.cljs
+  test/muesli/relay/relay_test.clj
+  e2e/run.sh  e2e/record.mjs  e2e/e2e.el
 ```
 
 ### 4.3 Data model (SQLite)
@@ -209,6 +210,8 @@ CREATE TABLE recordings (
   sha256       TEXT,                        -- of the assembled file
   delivered_at INTEGER,
   meeting_id   TEXT,                        -- muesli meeting id reported in ack
+  audio_deleted INTEGER NOT NULL DEFAULT 0,
+  last_part_at INTEGER,                     -- drives abandonment
   created_at   INTEGER NOT NULL);
 
 CREATE TABLE recording_parts (
@@ -226,7 +229,9 @@ The audio lives on disk under
 `<storage-dir>/<user-id>/<recording-id>/parts/<seq>.bin`. Parts are written
 to a temp file and renamed into place, so a half-written part is never
 visible. On `finish` the relay concatenates the parts in `seq` order into
-`audio.<ext>`, records the size and sha256, and deletes the parts.
+`audio.<ext>`, records the size and sha256, and deletes the part files.
+The part rows are kept (they are tiny), so a late retry of an
+already-received part is still answered `200` as a duplicate.
 
 ### 4.4 Recording state machine
 
@@ -298,6 +303,7 @@ existing curl wrapper once it supports GET and `--output` (§6.4).
 
 | Method & path | Purpose |
 |---|---|
+| `GET /app/api/me` | `{"username", "csrf"}`. Lets a page served from the service worker cache refresh its CSRF token. |
 | `GET /app/api/clients` | `[{"id", "name", "profiles", "last_seen_at"}]` for the logged-in user. |
 | `PUT /app/api/recordings/:id` | Create a recording. The id comes from the PWA, so retries are safe. Body: `{"client_id", "profile", "title", "mime_type", "started_at"}`. Returns `409` if the id exists under a different user. |
 | `PUT /app/api/recordings/:id/parts/:seq` | Raw body = part bytes, header `X-Part-SHA256`. Idempotent: the same seq with the same hash returns `200`, a different hash returns `409`. |
@@ -320,48 +326,29 @@ existing pipeline entry point used for finished local recordings.
 
 ### 6.1 Customization
 
-```elisp
-(defcustom muesli-relay-url nil
-  "Base URL of the muesli-relay server, e.g. \"https://relay.example\"."
-  :type '(choice (const nil) string)
-  :group 'muesli)
+| Variable | Meaning |
+|---|---|
+| `muesli-relay-url` | Base URL of the relay. |
+| `muesli-relay-api-key` | A string, or a function returning one (default: auth-source, login `muesli`, host of the URL). Resolved with `muesli--resolve-secret`. |
+| `muesli-relay-client-name` | Name shown in the PWA (default `system-name`). |
+| `muesli-relay-profiles` | `((NAME . PLIST) ...)`; see below. |
+| `muesli-relay-poll-interval` | Seconds between automatic fetches, or nil. |
+| `muesli-relay-keep-original` | Keep the downloaded file next to the chunks. |
+| `muesli-relay-default-category` / `-default-title` | Fallbacks when a profile sets neither. |
 
-(defcustom muesli-relay-api-key #'muesli-relay--auth-source-key
-  "API key for the relay: a string, or a function returning one.
-Resolved with `muesli--resolve-secret'.  The default looks up
-login \"muesli\" for the relay's host in `auth-source'."
-  :type '(choice string function)
-  :group 'muesli)
+Profile keys:
 
-(defcustom muesli-relay-client-name (system-name)
-  "Name this Emacs shows up under in the PWA."
-  :type 'string
-  :group 'muesli)
+- `:label` and `:description` are shown on the phone.
+- `:category` is the level 2 heading under `* Meetings`.
+- `:title` is a `format-time-string` template applied to the start time when the phone sends no title.
+- `:attendees` becomes the ATTENDEES property, which also feeds the diarization speaker-count hint.
+- `:file` names an org file to use instead of `muesli-meetings-file`.
+- `:hook` is a function called with the new meeting id.
 
-(defcustom muesli-relay-profiles
-  '((default :label "Meeting" :mode room)
-    (standup :label "Daily standup" :mode room :category "work"
-             :title "Standup %F"))
-  "Setups offered to the phone.  Each entry is (NAME . PLIST).
-Recognized keys: :label, :description, :mode, :category, :title
-\(a `format-time-string' template used when the phone sends no title),
-:hook (a function called with the new meeting id after import), and
-:let, a list of (VARIABLE . VALUE) bound dynamically around the
-import and pipeline start, so any muesli variable (transcription
-backend, language, summary prompt...) can be set per profile."
-  :type '(alist :key-type symbol :value-type plist)
-  :group 'muesli)
+Two ideas from the draft were dropped:
 
-(defcustom muesli-relay-poll-interval nil
-  "Seconds between automatic fetches, or nil to fetch only on command."
-  :type '(choice (const nil) integer)
-  :group 'muesli)
-
-(defcustom muesli-relay-keep-original nil
-  "When non-nil, keep the downloaded file after chunking it."
-  :type 'boolean
-  :group 'muesli)
-```
+- **`:mode`:** a phone captures one mic track, so imports are always `room`.
+- **`:let` bindings:** the pipeline runs asynchronously, so later steps would run outside the binding. Per-profile overrides need muesli itself to read them from the meeting (future work).
 
 ### 6.2 Commands
 
@@ -383,43 +370,47 @@ backend, language, summary prompt...) can be set per profile."
 
 ### 6.3 Import algorithm
 
-For each ready recording, sequentially:
+For each ready recording, sequentially (`muesli-relay--import`):
 
 1. **Dedup**: if `relay_imports` already has `remote_id`, just re-send
-   `ack` and skip. This covers a crash between import and ack.
-2. **Resolve profile**: if `profile` is not in `muesli-relay-profiles`,
+   `ack` and count it as "already imported". This covers a crash or a
+   failed ack between import and ack.
+2. **Resolve profile**: if the profile is not in `muesli-relay-profiles`,
    call `reject` with a reason and continue.
-3. **Download** to `<audio_dir>/relay-<id>.<ext>` with curl `--output`
-   and `-C -`. Verify size and sha256 (`secure-hash` on the file); on
-   mismatch, delete the file and retry once.
-4. **Chunk**: run ffmpeg to segment the file into
-   `chunk_seconds` pieces in the same format and naming that local recording
-   produces (`-f segment -segment_time N -c:a <codec> …`).
-5. **Create meeting**: in one SQLite transaction:
-   - call `muesli-db-meeting-create` with a fresh muesli meeting id,
-     `:mode` and `:category` from the profile, `:title` from the phone or
-     the profile template, `:notes_raw` from the phone's notes,
-     `:started_at` / `:ended_at` from the recording, `:status` set to the
-     pipeline's "recorded, awaiting transcription" status, `:audio_dir` and
-     `:chunk_seconds`;
-   - call `muesli-db-chunk-add` for each piece on the track name that the
-     room-mode recorder uses;
-   - insert the `relay_imports` row.
-6. **Ack**, then hand the meeting to the pipeline (the same function that
-   runs when a local recording is stopped), then run the profile's
+3. **Download** to `<muesli-audio-directory>/<meeting-id>/relay-source.<ext>`
+   with curl `-o`. Verify the size and sha256; on a mismatch, delete the file
+   and download once more. If it still fails, give up for this fetch; the
+   recording stays `ready` on the relay.
+4. **Chunk**: ffmpeg cuts the file into `mic-NNNNN.wav` chunks of
+   `muesli-chunk-seconds`, as 16 kHz mono 16-bit WAV. This is the format and
+   naming `muesli-record-ffmpeg` writes, so everything downstream treats it
+   as a local recording. The original is then deleted unless
+   `muesli-relay-keep-original` is set.
+5. **Heading**: append `*** [date] title` under `* Meetings` / `** category`
+   in the profile's file. This is the same layout as `muesli-capture`, but
+   without prompting. The heading gets `:ID:`, `:MUESLI_MODE: room`,
+   optionally `:ATTENDEES:`, the `recording` tag, and the phone's notes as
+   its body. The file is saved.
+6. **Meeting**: in one SQLite transaction (`muesli-db-with-transaction`),
+   create the meeting row with status `recording`, mode `room`, start and
+   end from the phone, plus the `relay_imports` row. Then call
+   `muesli--register-chunks-from-disk`, the same path `muesli-resume`
+   uses, which queues transcription.
+7. **Ack**, then `(muesli--advance id "transcribing")` and the profile's
    `:hook`.
 
-Everything runs asynchronously through `muesli--run`/`muesli--curl`. Emacs
-never blocks on the network. The downloaded original is deleted after
-chunking unless `muesli-relay-keep-original` is non-nil. A fetch that is
-already running makes a second `muesli-relay-fetch` (or timer tick) a no-op.
+Imports do not go through `muesli-start`/`muesli--recording`, so they can
+run while you are recording a meeting locally. If Emacs dies after step 6,
+the orphan check at startup offers to resume the meeting, and the next
+fetch only re-acks it.
 
 ### 6.4 Changes to existing modules
 
 - **`muesli-core.el`**: `muesli--curl` gains `:method` (default `"POST"`)
-  and `:output-file` (adds `--output FILE -C -`; the body is then not read
-  into memory). The bearer token stays in the private config file as it is
-  now.
+  and `:output-file` (`-o FILE`; the body is not read into memory, and the
+  partial file is deleted on error). The bearer token stays in the private
+  config file. The server supports `Range`, but Emacs does not resume
+  downloads yet: a failed download is simply retried on the next fetch.
 - **`muesli-db.el`**: append migration 2. Released migrations are never
   edited.
 
@@ -434,10 +425,10 @@ already running makes a second `muesli-relay-fetch` (or timer tick) a no-op.
       acked_at    INTEGER)")
   ```
 
-  Add helpers `muesli-db-relay-import-add`, `muesli-db-relay-import` and
-  `muesli-db-relay-import-mark-acked`.
-- The meeting buffer and list show a "relay" origin marker when a
-  `relay_imports` row exists (optional, cosmetic).
+  Helpers: `muesli-db-relay-import-add`, `muesli-db-relay-import`,
+  `muesli-db-relay-import-for-meeting`, `muesli-db-relay-import-mark-acked`,
+  and the `muesli-db-with-transaction` macro.
+- `Makefile` compiles `muesli-relay.el` and runs `test/muesli-relay-test.el`.
 
 ## 7. The PWA
 
@@ -467,8 +458,11 @@ already running makes a second `muesli-relay-fetch` (or timer tick) a no-op.
 - Each blob is written to IndexedDB as `{recording_id, seq, blob, sha256,
   uploaded: false}` **before** the upload is attempted.
 - The upload queue sends parts with bounded concurrency (2) and
-  exponential backoff. It resumes on the `online` event, on app start and
-  from a Background Sync registration where supported.
+  exponential backoff (1 s up to 60 s). It resumes on the `online` event, on
+  app start and every 15 s. Background Sync is not used in v1: uploads
+  continue only while the app is open.
+- A recording the server refuses outright (unknown profile, unsupported
+  type) keeps its audio, shows the reason, and does not block the others.
 - On Stop: flush the final blob, wait for the queue to drain, then call
   `finish`. If `finish` returns missing seqs, re-queue them from
   IndexedDB.
@@ -532,36 +526,43 @@ display and a theme color makes the app installable.
 
 ## 10. Open questions
 
-1. **Track name and status names.** The recorder and pipeline modules are
-   not in this repo yet. §6.3 assumes a single room-mode track and an
-   "awaiting transcription" meeting status. These need to match whatever
-   they actually use.
-2. **iOS fragmented MP4.** Safari's `MediaRecorder` timeslice output should
-   concatenate into a playable fMP4. This needs a test on a real device. The
-   fallback is to stop and restart the recorder every N seconds and upload
-   self-contained files, with Emacs concatenating them via ffmpeg's concat
+Resolved during implementation:
+
+- **Track and status names**: the track is `mic` and the mode is `room`. The
+  meeting starts as `recording` and enters the pipeline at `transcribing`,
+  as `muesli-resume` does (§6.3).
+- **Loopback shortcut**: the relay never enforces HTTPS itself; TLS is the
+  proxy's job. An Emacs on the same host can use `http://127.0.0.1:8787`.
+
+Still open:
+
+1. **iOS fragmented MP4.** Concatenated Safari `MediaRecorder` slices have
+   only been reasoned about; Chrome/WebM is covered by `e2e/run.sh`. This
+   needs a test on a real iPhone. The fallback is to stop and restart the
+   recorder every N seconds and concatenate in Emacs with ffmpeg's concat
    demuxer.
-3. **Loopback shortcut.** When relay and Emacs share a host, should the
-   client API also accept plain HTTP on 127.0.0.1? Proposal: yes, but only
-   for `/api/v1/client/*`.
-4. **Notify instead of poll.** v2 could add `GET
-   /api/v1/client/wait?timeout=30` (long-poll) so a timer gets near-instant
-   delivery without hammering the server.
-5. **Encryption at rest.** Audio sits on the relay until it is acked.
-   Optionally the PWA could encrypt to a client public key uploaded at link
-   time, so the relay only ever holds ciphertext.
+2. **Notify instead of poll.** A long-poll `GET /api/v1/client/wait` would
+   give near-instant delivery.
+3. **Encryption at rest.** The PWA could encrypt to a key Emacs uploads at
+   link time, so the relay only ever holds ciphertext.
+4. **Unsaved summary.** The pipeline applies the summary to the org buffer
+   and does not save it, the same as for local recordings. For imports, that
+   buffer is one the user never opened.
+5. **Background uploads.** Background Sync/Fetch would let uploads finish
+   after the app is closed.
 
 ## 11. Milestones
 
-1. **Relay skeleton**: config, DB, migrations, users CLI, login, API keys
-   page, `link` and `ping`. Emacs gets `muesli-relay-link` and
-   `muesli-relay-status`, plus the `muesli--curl` `:method` change.
-2. **Upload path**: recording create, parts, finish and assembly. A minimal
-   recorder page without offline support.
-3. **Hand-off**: list, audio download with Range, ack and reject. Emacs
-   gets `muesli-relay-fetch`, migration 2, ffmpeg chunking and the pipeline
-   call.
-4. **Durability & PWA polish**: IndexedDB queue, resume after a kill,
-   service worker, manifest, wake lock, history screen, reassign.
-5. **Hardening**: rate limits, sweeper, byte caps, iOS testing, docs for the
-   Caddy and Tailscale setups.
+All five v1 milestones are implemented:
+
+1. **Relay skeleton**: config, DB and migrations, users CLI, login, API keys
+   page, `link` and `ping`.
+2. **Upload path**: create, parts, finish and assembly.
+3. **Hand-off**: list, Range download, ack and reject;
+   `muesli-relay-fetch`, migration 2, ffmpeg chunking and the pipeline call.
+4. **Durability**: IndexedDB queue, resume after a kill, service worker,
+   manifest, wake lock, history and reassign.
+5. **Hardening**: login rate limits, sweeper, byte caps, CSP and CSRF.
+
+Not yet done: testing on a real iOS device, and Caddy/Tailscale walkthroughs
+beyond `relay/README.md`.

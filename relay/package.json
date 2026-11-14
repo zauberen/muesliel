@@ -1,0 +1,11 @@
+{
+  "name": "muesli-relay-pwa",
+  "private": true,
+  "scripts": {
+    "release": "shadow-cljs release app sw",
+    "watch": "shadow-cljs watch app sw"
+  },
+  "devDependencies": {
+    "shadow-cljs": "2.28.18"
+  }
+}

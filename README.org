@@ -162,6 +162,33 @@ Keys go to curl through a private config file, never on the command line.
 
 Other options worth knowing: =muesli-action-item-style= (=checkbox= or =todo=), =muesli-append-transcript= (adds a folded =:TRANSCRIPT:= drawer), =muesli-done-tag=, =muesli-keep-audio=, =muesli-summary-max-chars= (longer meetings are summarized in sections first), and =muesli-summary-prompt=. =M-x customize-group RET muesli= lists them all.
 
+* Recording on a phone (muesli-relay)
+
+=relay/= is a small self-hosted Clojure service with an installable web app. You record on your phone, and the recording waits on the relay until this Emacs fetches it and runs it through the normal pipeline. Emacs only makes outbound requests, so the relay can run on the same machine or anywhere else. See =relay/README.md= to run it and =docs/muesli-relay-spec.md= for the design.
+
+1. On the relay's web page, open *API keys* and create a key, then store it:
+   #+begin_src text
+   machine relay.example login muesli password msl_...
+   #+end_src
+2. Configure Emacs and link it:
+   #+begin_src emacs-lisp
+   (use-package muesli-relay
+     :after muesli
+     :commands (muesli-relay-link muesli-relay-fetch muesli-relay-status)
+     :custom
+     (muesli-relay-url "https://relay.example")
+     (muesli-relay-poll-interval 300)            ; or nil and fetch by hand
+     (muesli-relay-profiles
+      '((default :label "Meeting")
+        (standup :label "Daily standup" :category "Team Sync"
+                 :title "Standup %F" :attendees ("Ann" "Bob" "Me")))))
+   #+end_src
+   Then run =M-x muesli-relay-link=. Run it again whenever you change the profiles.
+3. On the phone, open the relay, log in and use "Add to Home Screen". Pick this Emacs and a profile, then record.
+4. =M-x muesli-relay-fetch= (or the poll timer) imports each finished recording as a meeting heading under =* Meetings= / =** <category>=, with the notes typed on the phone as its body. It is split into =muesli-chunk-seconds= chunks on the =mic= track (room mode), then transcribed, diarized and summarized like a local recording. =M-x muesli-relay-status= shows how many recordings are waiting.
+
+The relay deletes its copy of the audio once Emacs confirms the import. If a recording names a profile this Emacs no longer has, it is rejected: the phone shows why, and you can reassign it there.
+
 * Storage
 
 Everything lives in =muesli-database-file= (SQLite, default =$XDG_DATA_HOME/muesli/muesli.sqlite=): meetings, the chunk queue, transcript segments and speakers. Audio is written under =muesli-audio-directory= and deleted after a successful summary unless =muesli-keep-audio= is set. =*muesli-log*= has diagnostics.

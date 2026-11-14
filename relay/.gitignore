@@ -1,0 +1,8 @@
+.cpcache/
+.shadow-cljs/
+node_modules/
+target/
+data/
+resources/public/js/
+resources/public/sw.js
+resources/public/manifest.edn

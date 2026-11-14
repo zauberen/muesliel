@@ -183,8 +183,12 @@ CALLBACK receives (EXIT-CODE STDOUT STDERR) exactly once."
   "Marker curl appends before the HTTP status code.")
 
 (cl-defun muesli--curl (&key name url bearer form-fields form-files
-                             json-body timeout callback)
-  "Send an HTTP POST to URL with curl and call CALLBACK with the result.
+                             json-body timeout callback
+                             (method "POST") output-file)
+  "Send an HTTP request to URL with curl and call CALLBACK with the result.
+METHOD is the HTTP method, \"POST\" by default.  OUTPUT-FILE, when
+non-nil, receives the response body instead of the callback (which
+then gets (:ok \"\")); on failure the partial file is deleted.
 NAME labels the process.  BEARER, if non-nil, is an API token sent as
 an Authorization header through a private config file, never on the
 command line.  FORM-FIELDS is an alist of (NAME . VALUE) strings sent
@@ -202,8 +206,10 @@ the maximum time in seconds.  CALLBACK receives (:ok BODY) or
                                               (concat "Authorization: Bearer "
                                                       bearer)))))))
          (args (append
-                (list muesli-curl-command "-sS" "-X" "POST"
+                (list muesli-curl-command "-sS" "-X" method
                       "-w" (concat muesli--http-marker "%{http_code}"))
+                (when output-file
+                  (list "-o" (expand-file-name output-file)))
                 (when timeout (list "--max-time" (number-to-string timeout)))
                 (when config (list "-K" config))
                 (mapcan (lambda (f)
@@ -224,7 +230,10 @@ the maximum time in seconds.  CALLBACK receives (:ok BODY) or
      :callback
      (lambda (code stdout stderr)
        (when config (ignore-errors (delete-file config)))
-       (funcall callback (muesli--curl-result code stdout stderr))))))
+       (let ((result (muesli--curl-result code stdout stderr)))
+         (when (and output-file (eq (car result) :error))
+           (ignore-errors (delete-file output-file)))
+         (funcall callback result))))))
 
 (defun muesli--curl-result (code stdout stderr)
   "Turn curl's exit CODE, STDOUT and STDERR into (:ok BODY) or (:error MSG)."
