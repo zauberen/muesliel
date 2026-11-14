@@ -50,7 +50,7 @@ If Emacs exits mid-meeting, the next load offers to resume from whatever chunks 
   :custom
   (muesli-meetings-file org-meetings-file)          ; or (expand-file-name "meetings.org" org-directory)
   (muesli-stt-base-url "http://localhost:8080/v1")
-  (muesli-stt-model "parakeet-tdt-0.6b-v3")
+  (muesli-stt-model "parakeet-cpp-tdt-0.6b-v3")
   (muesli-diarization-backend 'localai)
   (muesli-diarization-model "parakeet-cpp-nemotron-3-diarization")
   (muesli-summary-backend 'openai)
@@ -97,27 +97,40 @@ Speaker labels from a single far-field microphone are approximate. The default p
 
 * Sample local speech server (LocalAI)
 
-LocalAI serves both Parakeet transcription and the =/v1/audio/diarization= endpoint, so one server covers both. A minimal container (add =--gpus all= and a CUDA image tag if you have an NVIDIA GPU):
+LocalAI serves both Parakeet transcription and the =/v1/audio/diarization= endpoint, so one server covers both. This setup was tested with LocalAI v4.12.1 on CPU:
 
 #+begin_src sh
-docker run -d --name local-ai -p 8080:8080 \
+mkdir -p ~/.local/share/localai/models
+docker run -d --name local-ai --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 \
   -v ~/.local/share/localai/models:/models \
+  -v localai-backends:/backends \
   localai/localai:latest
+
+# Transcription (1.3 GB) and diarization models from the gallery
+for id in parakeet-cpp-tdt-0.6b-v3 parakeet-cpp-nemotron-3-diarization; do
+  curl localhost:8080/models/apply -H 'Content-Type: application/json' \
+       -d "{\"id\": \"localai@$id\"}"
+done
+curl localhost:8080/v1/models   # both should be listed once the downloads finish
 #+end_src
 
-Then install models from the gallery. Names change between releases, so check the gallery in the web UI at http://localhost:8080 or with =curl localhost:8080/models/available=. When this README was written the diarization models included:
+The parakeet-cpp backend is downloaded into the =localai-backends= volume on first use. With an NVIDIA GPU, add =--gpus all= and use a CUDA image tag. =curl localhost:8080/models/available= lists the rest of the gallery (larger Parakeet models, bundles that combine ASR and diarization).
 
-#+begin_src sh
-# speaker turns only (what muesli needs, since it transcribes separately)
-curl localhost:8080/models/apply -H 'Content-Type: application/json' \
-  -d '{"id": "localai@parakeet-cpp-nemotron-3-diarization"}'
+The matching muesli settings are the defaults:
+
+#+begin_src emacs-lisp
+(setq muesli-stt-base-url "http://localhost:8080/v1"
+      muesli-stt-model "parakeet-cpp-tdt-0.6b-v3"
+      muesli-diarization-backend 'localai
+      muesli-diarization-model "parakeet-cpp-nemotron-3-diarization")
 #+end_src
 
-Install a Parakeet transcription model the same way, and set =muesli-stt-model= and =muesli-diarization-model= to the names listed by =curl localhost:8080/v1/models=. To check transcription by hand:
+To check transcription by hand:
 
 #+begin_src sh
-curl localhost:8080/v1/audio/transcriptions \
-  -F file=@test.wav -F model=parakeet-tdt-0.6b-v3 -F response_format=verbose_json
+curl localhost:8080/v1/audio/transcriptions -F file=@test.wav \
+  -F model=parakeet-cpp-tdt-0.6b-v3 -F response_format=verbose_json
 #+end_src
 
 If your server rejects the =timestamp_granularities[]= fields muesli sends, set =muesli-stt-extra-fields= to =nil=. Servers that return no =segments= still work: each chunk then becomes one segment.

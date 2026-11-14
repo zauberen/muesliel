@@ -35,7 +35,7 @@
   :type 'string
   :group 'muesli)
 
-(defcustom muesli-stt-model "parakeet-tdt-0.6b-v3"
+(defcustom muesli-stt-model "parakeet-cpp-tdt-0.6b-v3"
   "Transcription model name sent to the server."
   :type 'string
   :group 'muesli)
