@@ -16,51 +16,116 @@
 (defvar muesli-relay-test--log nil
   "Requests seen by the fake relay, newest first, as (METHOD PATH JSON).")
 
-(defun muesli-relay-test--fake (recordings &optional opts)
-  "Return a fake request function serving RECORDINGS.
-Each recording is an alist as the relay sends it plus (file . PATH)
-naming the audio to serve.  OPTS is a plist: :fail-ack t makes ack
-fail, :corrupt t serves the wrong bytes."
-  (let ((acked '()))
-    (cl-function
-     (lambda (&key method path json output-file _timeout callback)
-       (push (list method path json) muesli-relay-test--log)
-       (let ((reply
-              (cond
-               ((equal path "/link")
-                (list :ok '((client_id . "client-1") (user . "alice") (profiles . 2))))
-               ((equal path "/ping") (list :ok '((pending . 0) (user . "alice"))))
-               ((string-prefix-p "/recordings?" path)
-                (list :ok (mapcar (lambda (r) (assq-delete-all 'file (copy-alist r)))
-                                  (seq-remove (lambda (r) (member (alist-get 'id r) acked))
-                                              recordings))))
-               ((string-match "\\`/recordings/\\([^/]+\\)/\\(audio\\|ack\\|reject\\)\\'" path)
-                (let* ((id (match-string 1 path))
-                       (what (match-string 2 path))
-                       (r (seq-find (lambda (x) (equal (alist-get 'id x) id)) recordings)))
-                  (pcase what
-                    ("audio"
-                     (if (plist-get opts :corrupt)
-                         (with-temp-file output-file (insert "garbage"))
-                       (copy-file (alist-get 'file r) output-file t))
-                     (list :ok nil))
-                    ("ack" (if (plist-get opts :fail-ack)
-                               (list :error "HTTP 502: bad gateway")
-                             (push id acked)
-                             (list :ok `((id . ,id) (status . "delivered")))))
-                    ("reject" (push id acked) (list :ok nil)))))
-               (t (list :error (format "HTTP 404: %s" path))))))
-         (run-at-time 0.01 nil callback reply))))))
+(defvar muesli-relay-test--recs nil
+  "The fake relay's recordings: hash of id -> alist.")
 
-(defun muesli-relay-test--requests (re)
-  "Return logged requests whose path matches RE."
-  (seq-filter (lambda (r) (string-match-p re (nth 1 r))) muesli-relay-test--log))
+(defvar muesli-relay-test--opts nil
+  "Plist of fake relay behaviour: :fail-ack t makes ack fail.")
 
-(defun muesli-relay-test--make-audio (file seconds)
-  "Write SECONDS of a test tone to FILE (webm/opus) with ffmpeg."
-  (call-process (executable-find "ffmpeg") nil nil nil "-hide_banner" "-loglevel" "error" "-y"
-                "-f" "lavfi" "-i" (format "sine=frequency=440:duration=%s" seconds)
-                "-c:a" "libopus" "-b:a" "32k" file))
+(defun muesli-relay-test--rec (id)
+  "Return the fake relay recording ID."
+  (gethash id muesli-relay-test--recs))
+
+(defun muesli-relay-test--set (id &rest pairs)
+  "Set PAIRS (KEY VALUE ...) on fake relay recording ID."
+  (let ((r (muesli-relay-test--rec id)))
+    (cl-loop for (k v) on pairs by #'cddr
+             do (setf (alist-get k r) v))
+    (puthash id r muesli-relay-test--recs)))
+
+(defun muesli-relay-test--add (rec)
+  "Add recording REC (an alist with at least id) to the fake relay."
+  ;; Deep copy: `muesli-relay-test--set' mutates conses, and callers pass
+  ;; (back)quoted literals.
+  (puthash (alist-get 'id rec)
+           (copy-tree (append rec '((segs . nil) (stop_requested . nil) (next . 1))))
+           muesli-relay-test--recs))
+
+(defun muesli-relay-test--say (id text start end &optional speaker)
+  "The relay transcribed TEXT from START to END ms in recording ID."
+  (let* ((r (muesli-relay-test--rec id))
+         (n (alist-get 'next r)))
+    (muesli-relay-test--set
+     id 'next (1+ n)
+     'segs (append (alist-get 'segs r)
+                   (list `((id . ,n) (chunk_no . ,(/ start 30000)) (start_ms . ,start)
+                           (end_ms . ,end) (speaker . ,speaker) (text . ,text)
+                           (words . ((,start ,end ,text)))))))))
+
+(defun muesli-relay-test--status (r)
+  "The status reply for fake recording R."
+  `((id . ,(alist-get 'id r)) (status . ,(alist-get 'status r))
+    (origin . ,(alist-get 'origin r)) (title . ,(alist-get 'title r))
+    (started_at . ,(alist-get 'started_at r)) (duration_ms . ,(alist-get 'duration_ms r))
+    (notes . ,(alist-get 'notes r)) (failed_step . ,(alist-get 'failed_step r))
+    (error . ,(alist-get 'error r)) (stop_requested . ,(alist-get 'stop_requested r))
+    (segments . ,(length (alist-get 'segs r)))))
+
+(defun muesli-relay-test--reply (method path json)
+  "Compute the fake relay's reply to METHOD PATH with body JSON."
+  (cond
+   ((equal path "/link")
+    (list :ok '((client_id . "client-1") (user . "alice") (profiles . 2))))
+   ((equal path "/ping") (list :ok '((pending . 0) (user . "alice"))))
+   ((string-match "\\`/recordings\\?status=\\(.*\\)\\'" path)
+    (let ((want (match-string 1 path)) (out '()))
+      (maphash (lambda (_ r) (when (equal (alist-get 'status r) want)
+                               (push (muesli-relay-test--status (append r nil)) out)))
+               muesli-relay-test--recs)
+      (list :ok (mapcar (lambda (st)
+                          (let ((r (muesli-relay-test--rec (alist-get 'id st))))
+                            (append st `((profile . ,(alist-get 'profile r))
+                                         (ended_at . ,(alist-get 'ended_at r))))))
+                        out))))
+   ((and (equal path "/recordings") (equal method "POST"))
+    (let ((id (alist-get 'id json)))
+      (unless (muesli-relay-test--rec id)
+        (muesli-relay-test--add `((id . ,id) (status . "waiting") (origin . "emacs")
+                                  (title . ,(alist-get 'title json))
+                                  (speakers . ,(alist-get 'speakers json)) (profile . "")
+                                  (started_at . ,(alist-get 'started_at json)))))
+      (list :ok (muesli-relay-test--status (muesli-relay-test--rec id)))))
+   ((string-match "\\`/recordings/\\([^/?]+\\)\\(?:/\\([a-z]+\\)\\)?\\(?:\\?after=\\([0-9]+\\)\\)?\\'" path)
+    (let* ((id (match-string 1 path))
+           (what (match-string 2 path))
+           (after (string-to-number (or (match-string 3 path) "0")))
+           (r (muesli-relay-test--rec id)))
+      (cond
+       ((null r) (list :error "HTTP 404: no such recording"))
+       ((and (null what) (equal method "DELETE"))
+        (remhash id muesli-relay-test--recs) (list :ok '((deleted . t))))
+       ((null what) (list :ok (muesli-relay-test--status r)))
+       ((equal what "segments")
+        (list :ok (seq-filter (lambda (s) (> (alist-get 'id s) after)) (alist-get 'segs r))))
+       ((equal what "stop")
+        (if (equal (alist-get 'status r) "waiting")
+            (muesli-relay-test--set id 'status "abandoned")
+          (muesli-relay-test--set id 'stop_requested t))
+        (list :ok (muesli-relay-test--status (muesli-relay-test--rec id))))
+       ((equal what "retry")
+        (muesli-relay-test--set id 'status "processing" 'failed_step nil 'error nil)
+        (list :ok (muesli-relay-test--status (muesli-relay-test--rec id))))
+       ((equal what "ack")
+        (if (plist-get muesli-relay-test--opts :fail-ack)
+            (list :error "HTTP 502: bad gateway")
+          (muesli-relay-test--set id 'status "delivered" 'segs nil)
+          (list :ok `((id . ,id) (status . "delivered")))))
+       ((equal what "reject")
+        (muesli-relay-test--set id 'status "rejected") (list :ok nil))
+       (t (list :error (format "HTTP 404: %s" path))))))
+   (t (list :error (format "HTTP 404: %s" path)))))
+
+(cl-defun muesli-relay-test--fake (&key method path json _output-file _timeout callback)
+  "Fake `muesli-relay-request-function': answer METHOD PATH JSON via CALLBACK."
+  (push (list method path json) muesli-relay-test--log)
+  (let ((reply (muesli-relay-test--reply method path json)))
+    (run-at-time 0.01 nil callback reply)))
+
+(defun muesli-relay-test--requests (re &optional method)
+  "Return logged requests whose path matches RE (and METHOD, if given)."
+  (seq-filter (lambda (r) (and (string-match-p re (nth 1 r))
+                               (or (null method) (equal method (car r)))))
+              muesli-relay-test--log))
 
 (defmacro muesli-relay-test--with-env (&rest body)
   "Run BODY with a fresh database, meetings file and relay state."
@@ -81,6 +146,13 @@ fail, :corrupt t serves the wrong bytes."
             (muesli-relay--fetching nil)
             (muesli-relay--timer nil)
             (muesli-relay-test--log nil)
+            (muesli-relay-test--recs (make-hash-table :test #'equal))
+            (muesli-relay-test--opts nil)
+            (muesli-relay--watched (make-hash-table :test #'equal))
+            (muesli-relay--live-timer nil)
+            (muesli-relay-live-interval 0.1)
+            (muesli-ffmpeg-command "/nonexistent/ffmpeg")
+            (muesli--mode-line-timer nil)
             (muesli-relay-profiles
              '((default :label "Meeting")
                (standup :label "Daily standup" :category "Work" :title "Standup %F"
@@ -92,10 +164,13 @@ fail, :corrupt t serves the wrong bytes."
             (muesli-keep-audio nil)
             (muesli-summary-function-override
              (lambda (_p cb) (run-at-time 0.01 nil cb '(:ok "* Summary\nPhone meeting."))))
-            (muesli-relay-request-function (muesli-relay-test--fake nil)))
+            (muesli-relay-request-function #'muesli-relay-test--fake))
        (unwind-protect
-           (cl-letf (((symbol-function 'display-warning) #'ignore))
+           (cl-letf (((symbol-function 'display-warning) #'ignore)
+                     ((symbol-function 'muesli--when-idle) #'funcall))
              ,@body)
+         (when (timerp muesli-relay--live-timer) (cancel-timer muesli-relay--live-timer))
+         (when (timerp muesli--mode-line-timer) (cancel-timer muesli--mode-line-timer))
          (when-let* ((b (find-buffer-visiting muesli-meetings-file)))
            (with-current-buffer b (set-buffer-modified-p nil))
            (kill-buffer b))
@@ -111,15 +186,35 @@ fail, :corrupt t serves the wrong bytes."
   (muesli-relay-fetch)
   (muesli-test-wait (lambda () (not muesli-relay--fetching)) 30))
 
-(defun muesli-relay-test--recording (id file &rest extra)
-  "A relay recording alist with ID serving FILE, plus EXTRA pairs."
-  (append extra
-          `((id . ,id) (profile . "standup") (title . nil) (notes . "typed on the phone")
-            (mime_type . "audio/webm;codecs=opus") (duration_ms . 3500)
-            (bytes . ,(file-attribute-size (file-attributes file)))
-            (sha256 . ,(muesli-relay--file-sha256 file))
-            (started_at . 1763042400000) (ended_at . 1763042403500)
-            (file . ,file))))
+(defun muesli-relay-test--phone-recording (id &rest extra)
+  "A transcribed phone-started recording ID on the fake relay, plus EXTRA."
+  (muesli-relay-test--add
+   (append extra
+           `((id . ,id) (origin . "phone") (status . "transcribed") (profile . "standup")
+             (title . nil) (notes . "typed on the phone") (duration_ms . 3500)
+             (started_at . 1763042400000) (ended_at . 1763042403500))))
+  (muesli-relay-test--say id "Morning everyone." 0 1500 "mic:SPEAKER_00")
+  (muesli-relay-test--say id "Hi Ann." 1500 3000 "mic:SPEAKER_01"))
+
+(defun muesli-relay-test--meetings-file (content)
+  "Write CONTENT to the meetings file and return its buffer at point-min."
+  (with-temp-file muesli-meetings-file (insert content))
+  (let ((buf (find-file-noselect muesli-meetings-file)))
+    (with-current-buffer buf (goto-char (point-min)))
+    buf))
+
+(defun muesli-relay-test--start-phone-meeting ()
+  "Start a phone meeting on a fresh heading.  Return (MEETING-ID . REMOTE-ID)."
+  (with-current-buffer
+      (muesli-relay-test--meetings-file
+       "* Meetings\n** Work\n*** [2026-11-14 Sat] Standup\n:PROPERTIES:\n:ATTENDEES: Ann, Bob\n:END:\n- my notes\n")
+    (re-search-forward "Standup")
+    (let ((muesli-recording-source 'phone))
+      (muesli-start)))
+  (let ((id (plist-get muesli--recording :id))
+        (remote (plist-get muesli--recording :remote)))
+    (should (muesli-test-wait (lambda () (muesli-relay-test--rec remote)) 5))
+    (cons id remote)))
 
 ;;;; Tests
 
@@ -127,6 +222,8 @@ fail, :corrupt t serves the wrong bytes."
   (let ((muesli-relay-profiles '((standup :label "Daily" :category "Work") (bare))))
     (should (equal (muesli-relay--profile-json (car muesli-relay-profiles))
                    '((name . "standup") (label . "Daily") (description . "room · Work"))))
+    (let ((muesli-relay-profiles '((s :attendees ("A" "B" "C")))))
+      (should (equal (alist-get 'speakers (muesli-relay--profile-json (car muesli-relay-profiles))) 3)))
     (should (equal (alist-get 'label (muesli-relay--profile-json (cadr muesli-relay-profiles))) "bare"))
     (should (equal (muesli-relay--profile "bare") '(:label "bare")))
     (should-not (muesli-relay--profile "nope"))))
@@ -171,88 +268,209 @@ fail, :corrupt t serves the wrong bytes."
     (let ((muesli-relay-url "https://other.example"))
       (should-error (muesli-relay-fetch) :type 'user-error))))
 
-(ert-deftest muesli-relay-fetch-imports-and-runs-pipeline ()
-  (skip-unless (executable-find "ffmpeg"))
+(ert-deftest muesli-relay-fetch-imports-phone-recordings ()
   (muesli-relay-test--with-env
-    (let* ((audio (expand-file-name "phone.webm" muesli-data-directory))
-           (_ (muesli-relay-test--make-audio audio 3.5))
-           (rec (muesli-relay-test--recording "rec-1" audio))
-           (muesli-relay-request-function (muesli-relay-test--fake (list rec))))
-      (muesli-relay-test--link)
-      (muesli-relay-test--fetch)
-      (should (equal muesli-relay--last-result "imported 1 recording"))
-      (let* ((import (muesli-db-relay-import "rec-1"))
-             (id (plist-get import :meeting_id)))
-        (should import)
-        (should (plist-get import :acked_at))
-        (should (equal (nth 2 (car (muesli-relay-test--requests "/ack\\'")))
-                       `((meeting_id . ,id))))
-        (should (muesli-test-wait
-                 (lambda () (equal (plist-get (muesli-db-meeting id) :status) "done")) 30))
-        (let ((m (muesli-db-meeting id)))
-          (should (equal (plist-get m :mode) "room"))
-          (should (equal (plist-get m :category) "Work"))
-          (should (equal (plist-get m :title) "Standup 2025-11-13"))
-          (should (equal (plist-get m :notes_raw) "typed on the phone\n"))
-          (should (= (- (plist-get m :ended_at) (plist-get m :started_at)) 3)))
-        (with-current-buffer (find-buffer-visiting muesli-meetings-file)
-          (goto-char (point-min))
-          (should (re-search-forward "^\\*\\*\\* \\[2025-11-13 Thu\\] Standup 2025-11-13" nil t))
-          (should (equal (org-entry-get nil "ID") id))
-          (should (equal (org-entry-get nil "ATTENDEES") "Ann, Bob"))
-          (should-not (member "recording" (org-get-tags nil t)))
-          (should (string-search "Phone meeting." (muesli-org-body))))
-        ;; Four 1 s chunks of a 3.5 s recording, all transcribed.
-        (should (>= (length (muesli-db-segments id)) 6)))
-      ;; Nothing left to fetch.
-      (muesli-relay-test--fetch)
-      (should (equal muesli-relay--last-result "nothing waiting")))))
+    (muesli-relay-test--phone-recording "rec-1")
+    (muesli-relay-test--link)
+    (muesli-relay-test--fetch)
+    (should (equal muesli-relay--last-result "imported 1 recording"))
+    (let* ((import (muesli-db-relay-import "rec-1"))
+           (id (plist-get import :meeting_id)))
+      (should import)
+      (should (muesli-test-wait
+               (lambda () (equal (plist-get (muesli-db-meeting id) :status) "done")) 10))
+      (should (plist-get (muesli-db-relay-import "rec-1") :acked_at))
+      (should (equal (nth 2 (car (muesli-relay-test--requests "/ack\\'")))
+                     `((meeting_id . ,id))))
+      (let ((m (muesli-db-meeting id)))
+        (should (equal (plist-get m :mode) "room"))
+        (should (equal (plist-get m :category) "Work"))
+        (should (equal (plist-get m :title) "Standup 2025-11-13"))
+        (should (equal (plist-get m :notes_raw) "typed on the phone\n"))
+        (should-not (plist-get m :audio_dir)))
+      (should (equal (mapcar (lambda (s) (list (plist-get s :speaker) (plist-get s :text)
+                                               (plist-get s :words)))
+                             (muesli-db-segments id))
+                     '(("mic:SPEAKER_00" "Morning everyone." ((0 1500 "Morning everyone.")))
+                       ("mic:SPEAKER_01" "Hi Ann." ((1500 3000 "Hi Ann."))))))
+      (should (equal (mapcar (lambda (s) (plist-get s :label)) (muesli-db-speakers id))
+                     '("mic:SPEAKER_00" "mic:SPEAKER_01")))
+      (with-current-buffer (find-buffer-visiting muesli-meetings-file)
+        (goto-char (point-min))
+        (should (re-search-forward "^\\*\\*\\* \\[2025-11-13 Thu\\] Standup 2025-11-13" nil t))
+        (should (equal (org-entry-get nil "ID") id))
+        (should (equal (org-entry-get nil "ATTENDEES") "Ann, Bob"))
+        (should-not (member "recording" (org-get-tags nil t)))
+        (should (string-search "Phone meeting." (muesli-org-body)))))
+    ;; Nothing left to fetch.
+    (muesli-relay-test--fetch)
+    (should (equal muesli-relay--last-result "nothing waiting"))))
 
 (ert-deftest muesli-relay-failed-ack-is-retried-without-reimport ()
-  (skip-unless (executable-find "ffmpeg"))
   (muesli-relay-test--with-env
-    (let* ((audio (expand-file-name "phone.webm" muesli-data-directory))
-           (_ (muesli-relay-test--make-audio audio 1.5))
-           (rec (muesli-relay-test--recording "rec-2" audio '(title . "Planning")))
-           (muesli-relay-request-function (muesli-relay-test--fake (list rec) '(:fail-ack t))))
-      (muesli-relay-test--link)
-      (muesli-relay-test--fetch)
-      (should (equal muesli-relay--last-result "imported 1 recording"))
-      (should-not (plist-get (muesli-db-relay-import "rec-2") :acked_at))
-      ;; The relay still lists it; the second fetch only acks again.
-      (muesli-relay-test--fetch)
-      (should (equal muesli-relay--last-result "1 already imported"))
-      (should (= 1 (length (muesli-db-meetings))))
-      (should (equal (plist-get (car (muesli-db-meetings)) :title) "Planning"))
-      (should (= 2 (length (muesli-relay-test--requests "/ack\\'")))))))
+    (muesli-relay-test--phone-recording "rec-2" '(title . "Planning"))
+    (setq muesli-relay-test--opts '(:fail-ack t))
+    (muesli-relay-test--link)
+    (muesli-relay-test--fetch)
+    (should (equal muesli-relay--last-result "imported 1 recording"))
+    (let ((id (plist-get (muesli-db-relay-import "rec-2") :meeting_id)))
+      (should (muesli-test-wait
+               (lambda () (equal (plist-get (muesli-db-meeting id) :status) "done")) 10)))
+    (should-not (plist-get (muesli-db-relay-import "rec-2") :acked_at))
+    ;; The relay still lists it; the second fetch only acks again.
+    (setq muesli-relay-test--opts nil)
+    (muesli-relay-test--fetch)
+    (should (equal muesli-relay--last-result "1 already imported"))
+    (should (= 1 (length (muesli-db-meetings))))
+    (should (equal (plist-get (car (muesli-db-meetings)) :title) "Planning"))
+    (should (plist-get (muesli-db-relay-import "rec-2") :acked_at))))
 
 (ert-deftest muesli-relay-unknown-profile-is-rejected ()
   (muesli-relay-test--with-env
-    (let* ((audio (expand-file-name "x.webm" muesli-data-directory))
-           (_ (with-temp-file audio (insert "x")))
-           (rec (muesli-relay-test--recording "rec-3" audio '(profile . "retro")))
-           (muesli-relay-request-function (muesli-relay-test--fake (list rec))))
-      (muesli-relay-test--link)
-      (muesli-relay-test--fetch)
-      (should (equal muesli-relay--last-result "1 rejected (unknown profile)"))
-      (should (string-search "retro" (alist-get 'reason (nth 2 (car (muesli-relay-test--requests "/reject\\'"))))))
-      (should-not (muesli-db-meetings))
-      (should-not (muesli-relay-test--requests "/audio\\'")))))
+    (muesli-relay-test--phone-recording "rec-3" '(profile . "retro"))
+    (muesli-relay-test--link)
+    (muesli-relay-test--fetch)
+    (should (equal muesli-relay--last-result "1 rejected (unknown profile)"))
+    (should (string-search "retro" (alist-get 'reason (nth 2 (car (muesli-relay-test--requests "/reject\\'"))))))
+    (should-not (muesli-db-meetings))))
 
-(ert-deftest muesli-relay-checksum-mismatch-fails-cleanly ()
+(ert-deftest muesli-relay-phone-meeting-started-in-emacs ()
   (muesli-relay-test--with-env
-    (let* ((audio (expand-file-name "x.webm" muesli-data-directory))
-           (_ (with-temp-file audio (insert "real audio bytes")))
-           (rec (muesli-relay-test--recording "rec-4" audio))
-           (muesli-relay-request-function (muesli-relay-test--fake (list rec) '(:corrupt t))))
-      (muesli-relay-test--link)
-      (muesli-relay-test--fetch)
-      (should (equal muesli-relay--last-result "1 failed (see *muesli-log*)"))
-      ;; Downloaded twice (one retry), nothing imported, nothing acked.
-      (should (= 2 (length (muesli-relay-test--requests "/audio\\'"))))
-      (should-not (muesli-db-meetings))
-      (should-not (muesli-relay-test--requests "/ack\\'"))
-      (should-not (directory-files muesli-audio-directory nil "\\`[^.]")))))
+    (muesli-relay-test--link)
+    (pcase-let ((`(,id . ,remote) (muesli-relay-test--start-phone-meeting)))
+      ;; Emacs registered a waiting meeting with the speaker hint.
+      (let ((create (nth 2 (car (muesli-relay-test--requests "\\`/recordings\\'" "POST")))))
+        (should (equal (alist-get 'title create) "Standup"))
+        (should (equal (alist-get 'speakers create) 2)))
+      (should (plist-get muesli--recording :waiting))
+      (should (string-search "waiting for phone" (muesli--mode-line-string)))
+      (should (equal (plist-get (muesli-db-meeting id) :status) "recording"))
+      ;; The phone starts; the relay transcribes as it goes.
+      (muesli-relay-test--set remote 'status "recording" 'started_at (* 1000 (- (float-time) 60)))
+      (muesli-relay-test--say remote "Let's start." 0 2000)
+      (should (muesli-test-wait (lambda () (= 1 (length (muesli-db-segments id)))) 5))
+      (should-not (plist-get muesli--recording :waiting))
+      (should (string-match-p "REC [0:]*01:0[0-9]" (muesli--mode-line-string)))
+      (muesli-relay-test--say remote "First item." 30000 32000)
+      (should (muesli-test-wait (lambda () (= 2 (length (muesli-db-segments id)))) 5))
+      ;; Stop from Emacs: the relay is asked, the phone finishes.
+      (muesli-stop)
+      (should (muesli-relay-test--requests "/stop\\'" "POST"))
+      (should (alist-get 'stop_requested (muesli-relay-test--rec remote)))
+      (muesli-relay-test--set remote 'status "processing" 'notes "phone side note")
+      (should (muesli-test-wait (lambda () (null muesli--recording)) 5))
+      (should (equal (gethash id muesli--pipelines) "transcribing"))
+      ;; The relay finishes with diarized, re-split segments.
+      (muesli-relay-test--set remote 'segs nil 'duration_ms 62000)
+      (muesli-relay-test--say remote "Let's start." 0 2000 "mic:SPEAKER_00")
+      (muesli-relay-test--say remote "First" 30000 31000 "mic:SPEAKER_00")
+      (muesli-relay-test--say remote "item." 31000 32000 "mic:SPEAKER_01")
+      (muesli-relay-test--set remote 'status "transcribed")
+      (should (muesli-test-wait
+               (lambda () (equal (plist-get (muesli-db-meeting id) :status) "done")) 10))
+      (should (equal (mapcar (lambda (s) (plist-get s :speaker)) (muesli-db-segments id))
+                     '("mic:SPEAKER_00" "mic:SPEAKER_00" "mic:SPEAKER_01")))
+      (should (= 2 (length (muesli-db-speakers id))))
+      (should (equal (alist-get 'status (muesli-relay-test--rec remote)) "delivered"))
+      (should (= 62 (- (plist-get (muesli-db-meeting id) :ended_at)
+                       (plist-get (muesli-db-meeting id) :started_at))))
+      (let ((m (muesli-db-meeting id)))
+        (should (string-search "- my notes" (plist-get m :notes_raw)))
+        (should (string-search "phone side note" (plist-get m :notes_raw))))
+      (with-current-buffer (find-buffer-visiting muesli-meetings-file)
+        (goto-char (point-min))
+        (re-search-forward "Standup")
+        (should (string-search "Phone meeting." (muesli-org-body)))
+        (should-not (member "recording" (org-get-tags nil t))))
+      (should-not muesli-relay--live-timer))))
+
+(ert-deftest muesli-relay-phone-stops-by-itself ()
+  (muesli-relay-test--with-env
+    (muesli-relay-test--link)
+    (pcase-let ((`(,id . ,remote) (muesli-relay-test--start-phone-meeting)))
+      (muesli-relay-test--set remote 'status "recording" 'started_at (* 1000 (float-time)))
+      (muesli-relay-test--set remote 'status "processing")
+      (should (muesli-test-wait (lambda () (null muesli--recording)) 5))
+      (should (equal (gethash id muesli--pipelines) "transcribing"))
+      (should-not (muesli-relay-test--requests "/stop\\'")))))
+
+(ert-deftest muesli-relay-relay-failure-asks ()
+  (muesli-relay-test--with-env
+    (muesli-relay-test--link)
+    (pcase-let ((`(,id . ,remote) (muesli-relay-test--start-phone-meeting)))
+      (muesli-relay-test--set remote 'status "recording" 'started_at (* 1000 (float-time)))
+      (muesli-relay-test--set remote 'status "failed" 'failed_step "diarizing" 'error "no model")
+      (cl-letf (((symbol-function 'read-multiple-choice) (lambda (&rest _) '(?p "proceed"))))
+        (should (muesli-test-wait (lambda () (muesli-relay-test--requests "/retry\\'")) 5)))
+      (should (eq t (alist-get 'skip (nth 2 (car (muesli-relay-test--requests "/retry\\'"))))))
+      (muesli-relay-test--say remote "Hello." 0 1000)
+      (muesli-relay-test--set remote 'status "transcribed")
+      (should (muesli-test-wait
+               (lambda () (equal (plist-get (muesli-db-meeting id) :status) "done")) 10)))))
+
+(ert-deftest muesli-relay-later-fails-locally-and-resumes ()
+  (muesli-relay-test--with-env
+    (muesli-relay-test--link)
+    (pcase-let ((`(,id . ,remote) (muesli-relay-test--start-phone-meeting)))
+      (muesli-relay-test--set remote 'status "failed" 'failed_step "transcribing" 'error "STT down")
+      (cl-letf (((symbol-function 'read-multiple-choice) (lambda (&rest _) '(?l "later"))))
+        (should (muesli-test-wait
+                 (lambda () (equal (plist-get (muesli-db-meeting id) :status) "failed")) 5)))
+      (should (equal (plist-get (muesli-db-meeting id) :failed_step) "transcribing"))
+      (should-not (gethash id muesli-relay--watched))
+      ;; C-u M-x muesli-resume: skip the failed chunks on the relay.
+      (muesli-resume id t)
+      (should (muesli-test-wait (lambda () (muesli-relay-test--requests "/retry\\'")) 5))
+      (muesli-relay-test--say remote "Hello." 0 1000)
+      (muesli-relay-test--set remote 'status "transcribed")
+      (should (muesli-test-wait
+               (lambda () (equal (plist-get (muesli-db-meeting id) :status) "done")) 10)))))
+
+(ert-deftest muesli-relay-abort-deletes-remote ()
+  (muesli-relay-test--with-env
+    (muesli-relay-test--link)
+    (pcase-let ((`(,id . ,remote) (muesli-relay-test--start-phone-meeting)))
+      (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+        (muesli-abort))
+      (should (muesli-test-wait (lambda () (null (muesli-relay-test--rec remote))) 5))
+      (should-not (muesli-db-meeting id))
+      (should-not muesli--recording)
+      (should-not (gethash id muesli-relay--watched)))))
+
+(ert-deftest muesli-relay-stop-before-the-phone-started ()
+  (muesli-relay-test--with-env
+    (muesli-relay-test--link)
+    (pcase-let ((`(,id . ,_remote) (muesli-relay-test--start-phone-meeting)))
+      (muesli-stop)
+      (should (muesli-test-wait
+               (lambda () (equal (plist-get (muesli-db-meeting id) :status) "failed")) 5))
+      (should-not muesli--recording)
+      (should (string-search "No phone" (plist-get (muesli-db-meeting id) :error))))))
+
+(ert-deftest muesli-relay-resume-reattaches-after-restart ()
+  (muesli-relay-test--with-env
+    (muesli-relay-test--link)
+    (pcase-let ((`(,id . ,remote) (muesli-relay-test--start-phone-meeting)))
+      (muesli-relay-test--set remote 'status "recording" 'started_at (* 1000 (float-time)))
+      ;; Emacs dies: all in-memory state is gone.
+      (cancel-timer muesli--mode-line-timer)
+      (setq muesli--recording nil)
+      (clrhash muesli-relay--watched)
+      (muesli-resume id)
+      (should (equal (plist-get muesli--recording :remote) remote))
+      (muesli-relay-test--say remote "Still here." 0 1000)
+      (should (muesli-test-wait (lambda () (muesli-db-segments id)) 5))
+      (muesli-relay-test--set remote 'status "transcribed")
+      (should (muesli-test-wait
+               (lambda () (equal (plist-get (muesli-db-meeting id) :status) "done")) 10)))))
+
+(ert-deftest muesli-relay-start-requires-a-link ()
+  (muesli-relay-test--with-env
+    (with-current-buffer (muesli-relay-test--meetings-file "* Meetings\n*** M\n")
+      (re-search-forward "M$")
+      (let ((muesli-recording-source 'phone))
+        (should-error (muesli-start) :type 'user-error))
+      (should-not (muesli-db-meetings)))))
 
 (provide 'muesli-relay-test)
 ;;; muesli-relay-test.el ends here

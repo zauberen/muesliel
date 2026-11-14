@@ -162,8 +162,8 @@
     (is (= "mzxw6ytboi" (keys/base32 (.getBytes "foobar"))))))
 
 (deftest migrations-are-idempotent
-  (is (= 1 (db/migrate! (:ds *ctx*))))
-  (is (= 1 (db/version (:ds *ctx*)))))
+  (is (= 2 (db/migrate! (:ds *ctx*))))
+  (is (= 2 (db/version (:ds *ctx*)))))
 
 (deftest login-and-pages
   (add-user! "alice" "correct horse battery")
@@ -210,40 +210,36 @@
         k (new-key! s)]
     (is (= 412 (:status (client-req k :get "/api/v1/client/recordings"))))))
 
-(deftest record-and-hand-off
+(defn- transcribed!
+  "Pretend the pipeline transcribed recording ID (tests without one)."
+  [id]
+  (db/update-recording! (:ds *ctx*) id {:status "transcribed"}))
+
+(deftest upload-and-finish
   (let [{:keys [s k client-id]} (setup!)
         parts [(.getBytes "AAAA") (.getBytes "BBBBBB") (.getBytes "CC")]
         clients (json-body (app-req s :get "/app/api/clients"))]
     (is (= ["default" "standup"] (map :name (:profiles (first clients)))))
-    (let [id (upload! s client-id parts)
-          listed (json-body (client-req k :get "/api/v1/client/recordings"))
-          rec (first listed)]
-      (testing "listed for Emacs with metadata"
-        (is (= 1 (count listed)))
-        (is (= id (:id rec)))
-        (is (= "standup" (:profile rec)))
-        (is (= "phone notes" (:notes rec)))
-        (is (= 12 (:bytes rec)))
-        (is (= (sha256 (.getBytes "AAAABBBBBBCC")) (:sha256 rec))))
-      (testing "full download"
-        (let [r (client-req k :get (str "/api/v1/client/recordings/" id "/audio"))]
-          (is (= 200 (:status r)))
-          (is (= "AAAABBBBBBCC" (String. (body-bytes r))))))
-      (testing "range download"
-        (let [r (client-req k :get (str "/api/v1/client/recordings/" id "/audio") nil {"range" "bytes=4-"})]
-          (is (= 206 (:status r)))
-          (is (= "bytes 4-11/12" (get-in r [:headers "Content-Range"])))
-          (is (= "BBBBBBCC" (String. (body-bytes r)))))
-        (is (= 416 (:status (client-req k :get (str "/api/v1/client/recordings/" id "/audio")
-                                        nil {"range" "bytes=50-"})))))
+    (let [id (upload! s client-id parts)]
+      (testing "finish hands the recording to the pipeline"
+        (is (= "processing" (:status (db/recording (:ds *ctx*) id))))
+        (is (empty? (json-body (client-req k :get "/api/v1/client/recordings"))))
+        (is (= [id] (map :id (json-body (client-req k :get "/api/v1/client/recordings?status=processing"))))))
       (testing "re-uploading a part after finish is idempotent"
         (is (= 200 (:status (app-req s :put (str "/app/api/recordings/" id "/parts/0") (first parts)
                                      {"x-part-sha256" (sha256 (first parts))})))))
-      (testing "ack delivers and deletes the audio"
+      (testing "ack needs a transcript"
+        (is (= 409 (:status (client-req k :post (str "/api/v1/client/recordings/" id "/ack") {})))))
+      (testing "listed for Emacs once transcribed"
+        (transcribed! id)
+        (let [[rec :as listed] (json-body (client-req k :get "/api/v1/client/recordings"))]
+          (is (= 1 (count listed)))
+          (is (= {:id id :profile "standup" :notes "phone notes" :origin "phone"}
+                 (select-keys rec [:id :profile :notes :origin])))))
+      (testing "ack delivers"
         (is (= 200 (:status (client-req k :post (str "/api/v1/client/recordings/" id "/ack") {:meeting_id "m-1"}))))
         (is (= 200 (:status (client-req k :post (str "/api/v1/client/recordings/" id "/ack") {:meeting_id "m-1"}))))
         (is (empty? (json-body (client-req k :get "/api/v1/client/recordings"))))
-        (is (= 404 (:status (client-req k :get (str "/api/v1/client/recordings/" id "/audio")))))
         (is (= "delivered" (:status (first (json-body (app-req s :get "/app/api/recordings"))))))))))
 
 (deftest missing-parts-and-checksums
@@ -280,6 +276,7 @@
 (deftest reject-hides-until-reassigned
   (let [{:keys [s k client-id]} (setup!)
         id (upload! s client-id [(.getBytes "abc")])]
+    (transcribed! id)
     (is (= 200 (:status (client-req k :post (str "/api/v1/client/recordings/" id "/reject")
                                     {:reason "unknown profile standup"}))))
     (is (empty? (json-body (client-req k :get "/api/v1/client/recordings"))))
@@ -290,6 +287,7 @@
 (deftest users-are-isolated
   (let [{:keys [s client-id]} (setup!)
         id (upload! s client-id [(.getBytes "abc")])]
+    (transcribed! id)
     (add-user! "mallory" "correct horse battery")
     (let [m (login "mallory" "correct horse battery")
           mk (new-key! m)]
@@ -297,6 +295,9 @@
       (is (empty? (json-body (client-req mk :get "/api/v1/client/recordings"))))
       (is (= 404 (:status (client-req mk :get (str "/api/v1/client/recordings/" id "/audio")))))
       (is (= 404 (:status (client-req mk :post (str "/api/v1/client/recordings/" id "/ack") {}))))
+      (is (= 404 (:status (client-req mk :get (str "/api/v1/client/recordings/" id)))))
+      (is (= 404 (:status (client-req mk :get (str "/api/v1/client/recordings/" id "/segments")))))
+      (is (= 404 (:status (client-req mk :post (str "/api/v1/client/recordings/" id "/stop") {}))))
       (is (empty? (json-body (app-req m :get "/app/api/recordings"))))
       (is (= 409 (:status (app-req m :put (str "/app/api/recordings/" id)
                                    {:client_id client-id :profile "default" :mime_type "audio/mp4" :started_at 1}))))

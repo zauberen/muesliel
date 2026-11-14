@@ -19,21 +19,23 @@
 
 ;;; Commentary:
 
-;; Links this Emacs to a muesli-relay server (see relay/ and
-;; docs/muesli-relay-spec.md) so meetings recorded on a phone come back
-;; here and run through the normal pipeline.
+;; Links this Emacs to a muesli-relay server (see relay/,
+;; docs/muesli-relay-spec.md and docs/muesli-relay-transcription-spec.md)
+;; so meetings can be recorded on a phone.  The relay records,
+;; transcribes and diarizes; this Emacs only names speakers, summarizes
+;; with your notes and writes the org heading.  No ffmpeg, audio device
+;; or speech server is needed here, which is what makes muesli work on
+;; Windows.
 ;;
 ;;   1. Create an API key in the relay's web UI and store it in
 ;;      auth-source:  machine relay.example login muesli password msl_...
-;;   2. Set `muesli-relay-url' and `muesli-relay-profiles'.
+;;   2. Set `muesli-relay-url' (and `muesli-relay-profiles' for
+;;      recordings started on the phone).
 ;;   3. M-x muesli-relay-link     register this Emacs and its profiles
-;;   4. Record on the phone, then M-x muesli-relay-fetch (or set
-;;      `muesli-relay-poll-interval').
+;;   4. Either start a meeting here with `muesli-recording-source' set to
+;;      `phone' (or C-u C-u M-x muesli-start) and tap Record on the
+;;      phone, or record on the phone first and M-x muesli-relay-fetch.
 ;;
-;; Each fetched recording becomes a meeting heading under "* Meetings"
-;; in `muesli-meetings-file', is cut into `muesli-chunk-seconds' WAV
-;; chunks on the "mic" track (room mode) and enters the pipeline at
-;; "transcribing", exactly like a local recording after `muesli-stop'.
 ;; Emacs only makes outbound requests, so the relay can live anywhere.
 
 ;;; Code:
@@ -70,8 +72,8 @@ NAME is a symbol.  Recognized keys:
                 \"Phone recordings\")
   :title        `format-time-string' template used when the phone sends
                 no title, applied to the recording's start time
-  :attendees    list of names; becomes the ATTENDEES property, which
-                also tells diarization how many speakers to expect
+  :attendees    list of names; becomes the ATTENDEES property and
+                tells the relay's diarization how many speakers to expect
   :file         org file to capture into instead of `muesli-meetings-file'
   :hook         function called with the new meeting id after import"
   :type '(alist :key-type symbol :value-type plist)
@@ -84,9 +86,11 @@ loaded and already linked)."
   :type '(choice (const :tag "Only on command" nil) integer)
   :group 'muesli)
 
-(defcustom muesli-relay-keep-original nil
-  "When non-nil, keep the downloaded file next to the chunks."
-  :type 'boolean
+(defcustom muesli-relay-live-interval 5
+  "Seconds between polls of the relay during a phone meeting.
+While recording this pulls the live transcript; afterwards it waits
+for the relay to finish transcribing."
+  :type 'integer
   :group 'muesli)
 
 (defcustom muesli-relay-default-category "Phone recordings"
@@ -97,11 +101,6 @@ loaded and already linked)."
 (defcustom muesli-relay-default-title "Phone recording %F %R"
   "Title template for recordings without a title or a profile :title."
   :type 'string
-  :group 'muesli)
-
-(defcustom muesli-relay-download-timeout 3600
-  "Maximum seconds for downloading one recording."
-  :type 'integer
   :group 'muesli)
 
 (defvar muesli-relay--state nil
@@ -215,7 +214,8 @@ where VALUE is the parsed JSON (nil for downloads) or (:error MSG)."
                    (concat "room · " (or category muesli-relay-default-category)))))
     `((name . ,name)
       (label . ,(or (plist-get plist :label) name))
-      (description . ,desc))))
+      (description . ,desc)
+      ,@(when-let* ((a (plist-get plist :attendees))) `((speakers . ,(length a)))))))
 
 (defun muesli-relay--profile (name)
   "Return the plist of profile NAME (a string), or nil if unknown."
@@ -254,7 +254,7 @@ Safe to run again after changing profiles: the link is updated."
      :json `((name . ,muesli-relay-client-name)
              (profiles . ,(vconcat (mapcar #'muesli-relay--profile-json muesli-relay-profiles)))
              (emacs . ((version . ,emacs-version)
-                       (muesli . "relay-1"))))
+                       (muesli . "relay-2"))))
      :callback
      (lambda (result)
        (pcase result
@@ -343,46 +343,354 @@ must include \"ID\".  The layout matches `muesli-capture'."
     (save-buffer)
     (org-id-add-location (cdr (assoc "ID" properties)) (buffer-file-name))))
 
-;;;; Import
+;;;; Segments from the relay
 
-(defun muesli-relay--file-sha256 (file)
-  "Return the hex SHA-256 of FILE's bytes."
-  (with-temp-buffer
-    (set-buffer-multibyte nil)
-    (insert-file-contents-literally file)
-    (secure-hash 'sha256 (current-buffer))))
+(defun muesli-relay--words (words)
+  "Turn relay WORDS, a list of (START-MS END-MS WORD), into triples."
+  (mapcar (lambda (w) (list (nth 0 w) (nth 1 w) (nth 2 w))) words))
 
-(defun muesli-relay--extension (mime)
-  "Return a file extension for MIME type."
-  (pcase (car (split-string (downcase (or mime "")) ";"))
-    ("audio/webm" "webm") ("audio/ogg" "ogg") ("audio/mp4" "m4a")
-    ("audio/mpeg" "mp3") ("audio/wav" "wav") (_ "bin")))
+(defun muesli-relay--store-segments (id segments)
+  "Insert relay SEGMENTS (a list of alists) into meeting ID on track mic."
+  (dolist (seg segments)
+    (muesli-db-segment-add id "mic" (alist-get 'chunk_no seg)
+                           (alist-get 'start_ms seg) (alist-get 'end_ms seg)
+                           (alist-get 'text seg) (alist-get 'speaker seg)
+                           (muesli-relay--words (alist-get 'words seg)))))
 
-(defun muesli-relay-segment-command (source directory chunk-seconds)
-  "Return the ffmpeg command cutting SOURCE into DIRECTORY/mic-NNNNN.wav.
-Chunks are CHUNK-SECONDS long, 16 kHz mono 16-bit, the same format
-`muesli-record-ffmpeg' writes."
-  (list muesli-ffmpeg-command "-hide_banner" "-nostats" "-loglevel" "error" "-y"
-        "-i" source "-map" "0:a:0"
-        "-ac" "1" "-ar" "16000" "-c:a" "pcm_s16le"
-        "-f" "segment" "-segment_time" (number-to-string chunk-seconds)
-        "-segment_format" "wav" "-reset_timestamps" "1"
-        (expand-file-name "mic-%05d.wav" directory)))
+(defun muesli-relay--replace-segments (id segments)
+  "Replace meeting ID's transcript and speakers with relay SEGMENTS."
+  (muesli-db-with-transaction
+    (muesli-db--execute "DELETE FROM segments WHERE meeting_id = ?" (list id))
+    (muesli-db--execute "DELETE FROM speakers WHERE meeting_id = ?" (list id))
+    (muesli-relay--store-segments id segments)
+    (dolist (label (delete-dups (delq nil (mapcar (lambda (s) (alist-get 'speaker s))
+                                                  segments))))
+      (muesli-db-speaker-add id label))))
 
-(defun muesli-relay--segment (source directory chunk-seconds callback)
-  "Cut SOURCE into chunks in DIRECTORY, then call CALLBACK.
-CALLBACK receives nil on success or an error message.  CHUNK-SECONDS
-is the chunk length."
-  (muesli--require-executable muesli-ffmpeg-command "splitting phone recordings")
-  (muesli--run
-   :name "relay-segment"
-   :command (muesli-relay-segment-command source directory chunk-seconds)
-   :callback (lambda (code _out err)
-               (funcall callback
-                        (unless (and (= code 0) (muesli-record-chunk-files directory))
-                          (format "ffmpeg could not split the recording: %s"
-                                  (if (string-empty-p (string-trim err))
-                                      "no audio found" (string-trim err))))))))
+;;;; Watching meetings on the relay
+
+(defvar muesli-relay--watched (make-hash-table :test #'equal)
+  "Meeting id -> plist (:remote ID :after N :busy BOOL :await BOOL).
+:after is the last relay segment id stored during the live phase;
+:await is set once the pipeline waits for the final transcript.")
+
+(defvar muesli-relay--live-timer nil
+  "Timer polling watched meetings, or nil.")
+
+(defun muesli-relay--uuid ()
+  "Return a random lowercase UUID."
+  (downcase (org-id-uuid)))
+
+(defun muesli-relay--watch (id remote)
+  "Start polling the relay for meeting ID, recording REMOTE."
+  (unless (gethash id muesli-relay--watched)
+    (puthash id (list :remote remote :after 0) muesli-relay--watched))
+  (unless (timerp muesli-relay--live-timer)
+    (setq muesli-relay--live-timer
+          (run-at-time muesli-relay-live-interval muesli-relay-live-interval
+                       #'muesli-relay--poll-live))))
+
+(defun muesli-relay--unwatch (id)
+  "Stop polling for meeting ID."
+  (remhash id muesli-relay--watched)
+  (when (and (zerop (hash-table-count muesli-relay--watched))
+             (timerp muesli-relay--live-timer))
+    (cancel-timer muesli-relay--live-timer)
+    (setq muesli-relay--live-timer nil)))
+
+(defun muesli-relay--watch-put (id key value)
+  "Set KEY to VALUE in the watch state of meeting ID."
+  (when-let* ((w (gethash id muesli-relay--watched)))
+    (puthash id (plist-put w key value) muesli-relay--watched)))
+
+(defun muesli-relay--poll-live ()
+  "Timer function: poll every watched meeting that is not busy."
+  (maphash (lambda (id w)
+             (unless (plist-get w :busy)
+               (condition-case err
+                   (muesli-relay--poll-meeting id)
+                 (error (muesli-relay--watch-put id :busy nil)
+                        (muesli--log "relay poll of %s: %s" id (error-message-string err))))))
+           muesli-relay--watched))
+
+(defun muesli-relay--recording-p (id)
+  "Return non-nil if meeting ID is the active (phone) recording."
+  (and muesli--recording (equal (plist-get muesli--recording :id) id)))
+
+(defun muesli-relay--poll-meeting (id)
+  "Ask the relay about meeting ID and act on the answer."
+  (let ((remote (plist-get (gethash id muesli-relay--watched) :remote)))
+    (muesli-relay--watch-put id :busy t)
+    (muesli-relay--request
+     :method "GET" :path (format "/recordings/%s" remote)
+     :callback
+     (lambda (result)
+       (condition-case err
+           (pcase result
+             (`(:ok ,st) (muesli-relay--handle-status id remote st))
+             (`(:error ,msg)
+              (muesli-relay--watch-put id :busy nil)
+              (if (string-match-p "\\`HTTP 404" msg)
+                  (muesli-relay--lost id)
+                (muesli--log "relay status of %s: %s" id msg))))
+         (error (muesli-relay--watch-put id :busy nil)
+                (muesli--log "relay status of %s: %s" id (error-message-string err))))))))
+
+(defun muesli-relay--lost (id)
+  "The relay no longer knows meeting ID's recording."
+  (muesli-relay--unwatch id)
+  (when (muesli-relay--recording-p id)
+    (muesli-relay--clear-recording))
+  (unless (equal (plist-get (muesli-db-meeting id) :status) "done")
+    (muesli--fail id "transcribing" "The relay no longer has this recording")))
+
+(defun muesli-relay--clear-recording ()
+  "Drop the active recording state without processing."
+  (setq muesli--recording nil)
+  (when (timerp muesli--mode-line-timer) (cancel-timer muesli--mode-line-timer))
+  (force-mode-line-update t))
+
+(defun muesli-relay--handle-status (id remote st)
+  "Act on relay status ST (an alist) of meeting ID, recording REMOTE."
+  (let ((status (alist-get 'status st)))
+    (when (muesli-relay--recording-p id)
+      (setq muesli--recording (plist-put muesli--recording :waiting (equal status "waiting")))
+      (when (and (equal status "recording") (alist-get 'started_at st)
+                 (not (plist-get muesli--recording :phone-started)))
+        (setq muesli--recording
+              (plist-put (plist-put muesli--recording :phone-started t)
+                         :started (/ (alist-get 'started_at st) 1000.0)))
+        (muesli-db-meeting-update id :started_at (truncate (alist-get 'started_at st) 1000))
+        (muesli--message "The phone started recording \"%s\"" (plist-get muesli--recording :title))))
+    (pcase status
+      ((or "waiting" "recording" "processing")
+       (when (and (member status '("processing")) (muesli-relay--recording-p id))
+         (muesli-relay--phone-finished id))
+       (muesli-relay--pull-live id remote st))
+      ("transcribed"
+       (when (muesli-relay--recording-p id) (muesli-relay--phone-finished id))
+       (if (plist-get (gethash id muesli-relay--watched) :await)
+           (muesli-relay--final-pull id remote st)
+         (muesli-relay--pull-live id remote st)))
+      ("failed"
+       (when (muesli-relay--recording-p id) (muesli-relay--phone-finished id))
+       (if (plist-get (gethash id muesli-relay--watched) :await)
+           (muesli-relay--ask-failed id remote st)
+         (muesli-relay--watch-put id :busy nil)))
+      ("delivered"
+       (muesli-relay--watch-put id :busy nil)
+       (when (plist-get (gethash id muesli-relay--watched) :await)
+         ;; Acked before a crash: the transcript is already here.
+         (muesli-relay--unwatch id)
+         (muesli--after-diarize id (muesli--meeting-attendees id))))
+      ("abandoned"
+       (muesli-relay--unwatch id)
+       (when (muesli-relay--recording-p id)
+         (muesli-relay--clear-recording)
+         (ignore-errors (muesli--with-heading id (muesli--set-tag muesli-recording-tag nil))))
+       (muesli--fail id "recording" "No phone recorded this meeting (the relay gave up waiting)"))
+      (_ (muesli-relay--watch-put id :busy nil)))))
+
+(defun muesli-relay--phone-finished (id)
+  "The phone stopped recording meeting ID: run the normal stop path."
+  (when (muesli-relay--recording-p id)
+    (setq muesli--recording (plist-put muesli--recording :exited t))
+    (if-let* ((k (plist-get muesli--recording :on-exit)))
+        (funcall k)
+      (muesli--stop-recording))))
+
+(defun muesli-relay--pull-live (id remote st)
+  "Store new segments of meeting ID (recording REMOTE, status ST)."
+  (let ((after (or (plist-get (gethash id muesli-relay--watched) :after) 0)))
+    (if (<= (or (alist-get 'segments st) 0) 0)
+        (muesli-relay--watch-put id :busy nil)
+      (muesli-relay--request
+       :method "GET" :path (format "/recordings/%s/segments?after=%d" remote after)
+       :callback
+       (lambda (result)
+         (muesli-relay--watch-put id :busy nil)
+         (pcase result
+           (`(:ok ,segs)
+            (when (and segs (gethash id muesli-relay--watched))
+              (muesli-relay--store-segments id segs)
+              (muesli-relay--watch-put id :after
+                                       (apply #'max after (mapcar (lambda (s) (alist-get 'id s)) segs)))
+              (muesli--refresh-transcript id)))
+           (`(:error ,msg) (muesli--log "relay segments of %s: %s" id msg))))))))
+
+(defun muesli-relay--append-phone-notes (id notes)
+  "Add NOTES typed on the phone to the end of meeting ID's heading body."
+  (when (and notes (not (string-empty-p (string-trim notes))))
+    (ignore-errors
+      (muesli--with-heading id
+        (let ((body (muesli-org-body)))
+          (unless (string-search (string-trim notes) body)
+            (muesli-org-replace-body
+             (concat (string-trim-right body) (if (string-empty-p (string-trim body)) "" "\n\n")
+                     "Notes from the phone:\n" (string-trim notes)))))))))
+
+(defun muesli-relay--final-pull (id remote st)
+  "Fetch the final transcript of meeting ID (REMOTE, status ST), ack, go on."
+  (muesli-relay--request
+   :method "GET" :path (format "/recordings/%s/segments" remote)
+   :callback
+   (lambda (result)
+     (pcase result
+       (`(:error ,msg)
+        (muesli-relay--watch-put id :busy nil)
+        (muesli--log "relay transcript of %s: %s" id msg))
+       (`(:ok ,segs)
+        (condition-case err
+            (progn
+              (muesli-relay--replace-segments id segs)
+              (when-let* ((d (alist-get 'duration_ms st))
+                          (m (muesli-db-meeting id)))
+                (muesli-db-meeting-update id :ended_at (+ (truncate (plist-get m :started_at))
+                                                          (truncate d 1000))))
+              (muesli-relay--append-phone-notes id (alist-get 'notes st))
+              (muesli-relay--unwatch id)
+              (muesli--refresh-transcript id)
+              (muesli-relay--ack remote id #'ignore)
+              (muesli--message "Transcript of \"%s\" is in (%d segments)"
+                               (plist-get (muesli-db-meeting id) :title) (length segs))
+              (muesli--after-diarize id (muesli--meeting-attendees id)))
+          (error (muesli--fail id "transcribing" (error-message-string err)))))))))
+
+(defun muesli-relay--ask-failed (id remote st)
+  "Ask what to do about meeting ID whose recording REMOTE failed (status ST)."
+  (unless (plist-get (gethash id muesli-relay--watched) :asking)
+    (muesli-relay--watch-put id :asking t)
+    (let ((step (or (alist-get 'failed_step st) "transcribing"))
+          (err (or (alist-get 'error st) "unknown error")))
+      (muesli--when-idle
+       (lambda ()
+         (let ((choice (car (read-multiple-choice
+                             (format "muesli: the relay failed while %s \"%s\": %s.  "
+                                     step (plist-get (muesli-db-meeting id) :title) err)
+                             '((?r "retry" "Try the failed step again")
+                               (?p "proceed" "Continue without it")
+                               (?l "later" "Stop here; `muesli-resume' continues later"))))))
+           (muesli-relay--watch-put id :asking nil)
+           (if (memq choice '(?r ?p))
+               (muesli-relay--request
+                :method "POST" :path (format "/recordings/%s/retry" remote)
+                :json `((skip . ,(if (eq choice ?p) t :false)))
+                :callback (lambda (r)
+                            (muesli-relay--watch-put id :busy nil)
+                            (when (eq (car r) :error)
+                              (muesli--log "relay retry of %s: %s" id (cadr r)))))
+             (muesli-relay--unwatch id)
+             (muesli--fail id step (format "Relay: %s" err)))))))))
+
+;;;; Starting, stopping and resuming phone meetings
+
+(defun muesli-relay-check-linked ()
+  "Signal a `user-error' unless this Emacs is linked to the relay."
+  (muesli-relay--linked-state)
+  (muesli-relay--api-key)
+  t)
+
+(defun muesli-relay-start-meeting (id info file)
+  "Create meeting ID (heading INFO in FILE) to be recorded on a phone.
+Registers a waiting recording on the relay and returns the state plist
+for `muesli--recording'."
+  (let* ((state (muesli-relay--linked-state))
+         (remote (muesli-relay--uuid))
+         (title (plist-get info :title))
+         (attendees (plist-get info :attendees))
+         (now (float-time)))
+    (muesli-db-with-transaction
+      (muesli-db-meeting-create
+       id :file file :title title :category (plist-get info :category) :mode "room"
+       :started_at (truncate now) :status "recording")
+      (muesli-db-relay-import-add remote id (plist-get state :url) ""))
+    (muesli-relay--create-remote id remote)
+    (muesli-relay--watch id remote)
+    (ignore attendees)
+    (list :id id :title title :mode 'room :remote remote :started now :waiting t
+          :stop (lambda (&optional how) (muesli-relay--stop-remote id remote how))
+          :watch-stop #'ignore)))
+
+(defun muesli-relay--create-remote (id remote)
+  "Register the waiting relay recording REMOTE for meeting ID."
+  (let* ((m (muesli-db-meeting id))
+         (attendees (muesli--meeting-attendees id)))
+    (muesli-relay--request
+     :method "POST" :path "/recordings"
+     :json `((id . ,remote) (title . ,(plist-get m :title))
+             (speakers . ,(if attendees (length attendees) :null))
+             (started_at . ,(* 1000 (plist-get m :started_at))))
+     :callback (lambda (result)
+                 (pcase result
+                   (`(:error ,msg)
+                    (display-warning
+                     'muesli
+                     (format "Could not register \"%s\" with the relay: %s.  muesli keeps retrying; \\[muesli-abort] cancels."
+                             (plist-get m :title) msg)
+                     :warning)))))))
+
+(defun muesli-relay--stop-remote (id remote how)
+  "Ask the relay to stop REMOTE (meeting ID); HOW `kill' discards it."
+  (if (eq how 'kill)
+      (progn
+        (muesli-relay--unwatch id)
+        (muesli-relay--request :method "DELETE" :path (format "/recordings/%s" remote)
+                               :callback #'ignore))
+    (muesli--message "Asking the phone to stop; waiting for its last upload…")
+    (muesli-relay--request
+     :method "POST" :path (format "/recordings/%s/stop" remote)
+     :json '((reason . "emacs"))
+     :callback (lambda (result)
+                 (pcase result
+                   (`(:ok ,st)
+                    (when (equal (alist-get 'status st) "abandoned")
+                      ;; No phone ever picked it up.
+                      (muesli-relay--handle-status id remote st)))
+                   (`(:error ,msg) (muesli--log "relay stop of %s: %s" id msg)))))
+    (muesli-relay--poll-soon id)))
+
+(defun muesli-relay--poll-soon (id)
+  "Poll meeting ID right away instead of at the next tick."
+  (run-at-time 0.5 nil (lambda ()
+                         (when-let* ((w (gethash id muesli-relay--watched)))
+                           (unless (plist-get w :busy) (muesli-relay--poll-meeting id))))))
+
+(defun muesli-relay-await-transcript (id)
+  "Pipeline step for phone meeting ID: wait for the relay's transcript."
+  (let ((row (muesli-db-relay-import-for-meeting id)))
+    (muesli-relay--watch id (plist-get row :remote_id))
+    (muesli-relay--watch-put id :await t)
+    (muesli-relay--poll-soon id)))
+
+(defun muesli-relay-resume (id &optional skip)
+  "Continue phone meeting ID after an interruption.
+SKIP non-nil continues without a step that failed on the relay."
+  (let* ((meeting (muesli-db-meeting id))
+         (row (muesli-db-relay-import-for-meeting id))
+         (remote (plist-get row :remote_id)))
+    (muesli-relay--linked-state)
+    (if (and (equal (plist-get meeting :status) "recording") (null muesli--recording))
+        ;; Maybe still recording on the phone: become the recorder again.
+        (progn
+          (setq muesli--recording
+                (list :id id :title (plist-get meeting :title) :mode 'room :remote remote
+                      :started (float-time) :waiting t
+                      :stop (lambda (&optional how) (muesli-relay--stop-remote id remote how))
+                      :watch-stop #'ignore))
+          (muesli--start-recording-ui id)
+          (muesli-relay--watch id remote)
+          (muesli-relay--poll-soon id)
+          (muesli--message "Reattached to phone meeting \"%s\"" (plist-get meeting :title)))
+      (let ((go (lambda ()
+                  (muesli--message "Resuming \"%s\" at transcribing" (plist-get meeting :title))
+                  (muesli--advance id "transcribing"))))
+        (if (and skip (equal (plist-get meeting :status) "failed"))
+            (muesli-relay--request
+             :method "POST" :path (format "/recordings/%s/retry" remote) :json '((skip . t))
+             :callback (lambda (_) (funcall go)))
+          (funcall go))))))
+
+;;;; Importing phone-started recordings
 
 (defun muesli-relay--ack (remote-id meeting-id callback)
   "Confirm REMOTE-ID as imported into MEETING-ID, then call CALLBACK."
@@ -402,92 +710,45 @@ is the chunk length."
    :json `((reason . ,reason))
    :callback (lambda (_) (funcall callback))))
 
-(defun muesli-relay--download (rec file callback &optional retried)
-  "Download recording REC to FILE and verify it, then call CALLBACK.
-CALLBACK receives nil on success or an error message.  RETRIED is
-non-nil on the second attempt after a checksum mismatch."
-  (let ((id (alist-get 'id rec)))
-    (muesli-relay--request
-     :method "GET" :path (format "/recordings/%s/audio" id)
-     :output-file file :timeout muesli-relay-download-timeout
-     :callback
-     (lambda (result)
-       (pcase result
-         (`(:error ,msg) (funcall callback (format "download failed: %s" msg)))
-         (_
-          (let ((size (file-attribute-size (file-attributes file)))
-                (want-size (alist-get 'bytes rec))
-                (want-sha (alist-get 'sha256 rec)))
-            (cond
-             ((and (or (not want-size) (eql size want-size))
-                   (or (not want-sha) (equal (muesli-relay--file-sha256 file) want-sha)))
-              (funcall callback nil))
-             (retried
-              (ignore-errors (delete-file file))
-              (funcall callback "downloaded file does not match its checksum"))
-             (t
-              (ignore-errors (delete-file file))
-              (muesli-relay--download rec file callback t))))))))))
-
 (defun muesli-relay--import (rec callback)
-  "Import relay recording REC (an alist), then call CALLBACK.
+  "Import transcribed relay recording REC (an alist), then call CALLBACK.
 CALLBACK receives a symbol: `imported', `acked' (seen before),
-`rejected' or `failed'."
+`rejected', `skipped' (an Emacs-started one) or `failed'."
   (let* ((remote-id (alist-get 'id rec))
          (profile-name (alist-get 'profile rec))
          (profile (muesli-relay--profile profile-name))
          (seen (muesli-db-relay-import remote-id)))
     (cond
      (seen
-      (muesli-relay--ack remote-id (plist-get seen :meeting_id)
-                         (lambda () (funcall callback 'acked))))
+      ;; Ours already; the watcher of an unfinished meeting takes it from here.
+      (if (member (plist-get (muesli-db-meeting (plist-get seen :meeting_id)) :status)
+                  '("recording" "transcribing" "failed"))
+          (funcall callback 'skipped)
+        (muesli-relay--ack remote-id (plist-get seen :meeting_id)
+                           (lambda () (funcall callback 'acked)))))
+     ((equal (alist-get 'origin rec) "emacs")
+      (funcall callback 'skipped))
      ((null profile)
       (muesli-relay--reject remote-id
                             (format "Emacs \"%s\" has no profile \"%s\" (run muesli-relay-link after changing profiles)"
                                     muesli-relay-client-name profile-name)
                             (lambda () (funcall callback 'rejected))))
      (t
-      (let* ((id (org-id-new))
-             (dir (expand-file-name (muesli--file-safe id) muesli-audio-directory))
-             (source (expand-file-name
-                      (concat "relay-source." (muesli-relay--extension (alist-get 'mime_type rec)))
-                      dir))
-             (fail (lambda (msg)
-                     (muesli--message "Could not import phone recording %s: %s" remote-id msg)
-                     (ignore-errors (delete-directory dir t))
-                     (funcall callback 'failed))))
-        (make-directory dir t)
-        (muesli-relay--download
-         rec source
-         (lambda (err)
-           (if err
-               (funcall fail err)
-             (muesli-relay--segment
-              source dir muesli-chunk-seconds
-              (lambda (err)
-                (if err
-                    (funcall fail err)
-                  (unless muesli-relay-keep-original
-                    (ignore-errors (delete-file source)))
-                  (let ((err (condition-case e
-                                 (progn (muesli-relay--create-meeting id dir rec profile-name profile)
-                                        nil)
-                               (error (error-message-string e)))))
-                    (if (and err (not (muesli-db-relay-import remote-id)))
-                        (funcall fail err)
-                      ;; Once the import row exists the meeting is ours: a
-                      ;; later problem is for `muesli-resume', not a re-import.
-                      (when err (muesli--log "relay import of %s: %s" remote-id err))
-                      (muesli-relay--ack
-                       remote-id id
-                       (lambda ()
-                         (muesli-relay--start-pipeline id profile)
-                         (funcall callback 'imported))))))))))))))))
+      (let ((id (org-id-new)))
+        (condition-case e
+            (progn
+              (muesli-relay--create-meeting id rec profile-name profile)
+              (muesli-relay--start-pipeline id profile)
+              (funcall callback 'imported))
+          (error
+           (muesli--message "Could not import phone recording %s: %s" remote-id
+                            (error-message-string e))
+           (funcall callback 'failed))))))))
 
-(defun muesli-relay--create-meeting (id dir rec profile-name profile)
-  "Create meeting ID for REC with audio in DIR.
+(defun muesli-relay--create-meeting (id rec profile-name profile)
+  "Create meeting ID for relay recording REC.
 PROFILE-NAME and PROFILE (a plist) say how.  Writes the org heading,
-the meeting row, the import row and the chunks."
+the meeting row and the import row."
   (let* ((started (/ (or (alist-get 'started_at rec) (* 1000 (float-time))) 1000.0))
          (ended (if-let* ((e (alist-get 'ended_at rec))) (/ e 1000.0)
                   (+ started (/ (or (alist-get 'duration_ms rec) 0) 1000.0))))
@@ -505,11 +766,9 @@ the meeting row, the import row and the chunks."
     (muesli-db-with-transaction
       (muesli-db-meeting-create
        id :file file :title title :category category :mode "room"
-       :started_at (truncate started) :ended_at (truncate ended)
-       :status "recording" :audio_dir dir :chunk_seconds muesli-chunk-seconds)
+       :started_at (truncate started) :ended_at (truncate ended) :status "transcribing")
       (muesli-db-relay-import-add (alist-get 'id rec) id (plist-get muesli-relay--state :url)
-                                  profile-name))
-    (muesli--register-chunks-from-disk id)))
+                                  profile-name))))
 
 (defun muesli-relay--start-pipeline (id profile)
   "Move imported meeting ID into the pipeline and run PROFILE's hook."
@@ -522,7 +781,7 @@ the meeting row, the import row and the chunks."
 
 ;;;###autoload
 (defun muesli-relay-fetch (&optional quiet)
-  "Fetch recordings waiting on the relay and import them.
+  "Import recordings started on the phone that the relay has transcribed.
 With QUIET (used by the poll timer), say nothing when there is
 nothing to fetch."
   (interactive)
@@ -537,16 +796,17 @@ nothing to fetch."
                     (muesli--message "Relay: %s" summary)))))
       (condition-case err
           (muesli-relay--request
-           :method "GET" :path "/recordings?status=ready"
+           :method "GET" :path "/recordings?status=transcribed"
            :callback
            (lambda (result)
              (pcase result
                (`(:error ,msg) (funcall done (format "fetch failed: %s" msg)))
                (`(:ok ,recs)
-                (if (null recs)
+                (if (null (seq-remove (lambda (r) (equal (alist-get 'origin r) "emacs")) recs))
                     (funcall done "nothing waiting")
                   (let ((counts (list (cons 'imported 0) (cons 'acked 0)
-                                      (cons 'rejected 0) (cons 'failed 0))))
+                                      (cons 'rejected 0) (cons 'failed 0)
+                                      (cons 'skipped 0))))
                     (cl-labels
                         ((next (rest)
                            (if (null rest)

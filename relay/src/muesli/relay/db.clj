@@ -64,7 +64,37 @@
         received_at  INTEGER NOT NULL,
         PRIMARY KEY (recording_id, seq))"
      "CREATE INDEX recordings_client_status ON recordings(client_id, status)"
-     "CREATE INDEX recordings_user_created ON recordings(user_id, created_at)"]]])
+     "CREATE INDEX recordings_user_created ON recordings(user_id, created_at)"]]
+   [2
+    ["ALTER TABLE recordings ADD COLUMN origin TEXT NOT NULL DEFAULT 'phone'"
+     "ALTER TABLE recordings ADD COLUMN speakers INTEGER"
+     "ALTER TABLE recordings ADD COLUMN stop_requested INTEGER NOT NULL DEFAULT 0"
+     "ALTER TABLE recordings ADD COLUMN chunks_complete INTEGER NOT NULL DEFAULT 0"
+     "ALTER TABLE recordings ADD COLUMN failed_step TEXT"
+     "ALTER TABLE recordings ADD COLUMN error TEXT"
+     "UPDATE recordings SET status = 'processing' WHERE status = 'ready'"
+     "CREATE TABLE chunks (
+        recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+        chunk_no     INTEGER NOT NULL,
+        path         TEXT NOT NULL,
+        status       TEXT NOT NULL,
+        attempts     INTEGER NOT NULL DEFAULT 0,
+        not_before   INTEGER NOT NULL DEFAULT 0,
+        offset_ms    INTEGER NOT NULL,
+        duration_ms  INTEGER NOT NULL,
+        error        TEXT,
+        PRIMARY KEY (recording_id, chunk_no))"
+     "CREATE TABLE segments (
+        id           INTEGER PRIMARY KEY,
+        recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+        chunk_no     INTEGER NOT NULL,
+        start_ms     INTEGER NOT NULL,
+        end_ms       INTEGER NOT NULL,
+        speaker      TEXT,
+        text         TEXT NOT NULL,
+        words        TEXT)"
+     "CREATE INDEX segments_recording ON segments(recording_id, id)"
+     "CREATE INDEX chunks_status ON chunks(status)"]]])
 
 (def ^:private opts {:builder-fn rs/as-unqualified-lower-maps})
 
@@ -210,12 +240,25 @@
 (defn user-recording [ds user-id id]
   (q1 ds ["SELECT * FROM recordings WHERE id = ? AND user_id = ?" id user-id]))
 
-(defn create-recording! [ds {:keys [id user-id client-id profile title mime-type started-at]}]
+(defn create-recording!
+  "Insert a recording.  Phone-origin rows start `recording`; Emacs-origin
+  rows start `waiting` with no MIME type yet."
+  [ds {:keys [id user-id client-id profile title mime-type started-at origin speakers]
+       :or {origin "phone"}}]
   (let [t (now)]
     (exec! ds ["INSERT INTO recordings (id, user_id, client_id, profile, title, mime_type, status,
-                                        started_at, last_part_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'recording', ?, ?, ?)"
-               id user-id client-id profile title mime-type started-at t t])))
+                                        started_at, last_part_at, created_at, origin, speakers)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+               id user-id client-id (or profile "") title (or mime-type "")
+               (if (= origin "emacs") "waiting" "recording")
+               (or started-at t) t t origin speakers])))
+
+(defn waiting-for-user
+  "Emacs-origin recordings of USER-ID that no phone has picked up yet."
+  [ds user-id]
+  (q ds ["SELECT r.id, r.client_id, c.name AS client_name, r.title, r.created_at
+            FROM recordings r JOIN clients c ON c.id = r.client_id
+           WHERE r.user_id = ? AND r.status = 'waiting' ORDER BY r.created_at DESC" user-id]))
 
 (defn recordings-for-user [ds user-id limit]
   (q ds ["SELECT r.*, c.name AS client_name FROM recordings r
@@ -223,11 +266,11 @@
            WHERE r.user_id = ? ORDER BY r.created_at DESC LIMIT ?" user-id limit]))
 
 (defn recordings-for-client
-  "Recordings assigned to CLIENT-ID in STATUS.  Rejected ready ones are
-  left out so Emacs does not reject them again on every fetch."
+  "Recordings assigned to CLIENT-ID in STATUS.  Rejected transcribed ones
+  are left out so Emacs does not reject them again on every fetch."
   [ds client-id status]
   (q ds [(str "SELECT * FROM recordings WHERE client_id = ? AND status = ?"
-              (when (= status "ready") " AND reject_reason IS NULL")
+              (when (= status "transcribed") " AND reject_reason IS NULL")
               " ORDER BY started_at")
          client-id status]))
 
@@ -264,3 +307,101 @@
 
 (defn delete-parts! [ds recording-id]
   (exec! ds ["DELETE FROM recording_parts WHERE recording_id = ?" recording-id]))
+
+;;;; Chunks and segments
+
+(defn chunk-numbers [ds recording-id]
+  (set (map :chunk_no (q ds ["SELECT chunk_no FROM chunks WHERE recording_id = ?" recording-id]))))
+
+(defn last-chunk [ds recording-id]
+  (q1 ds ["SELECT * FROM chunks WHERE recording_id = ? ORDER BY chunk_no DESC LIMIT 1" recording-id]))
+
+(defn add-chunk! [ds {:keys [recording-id chunk-no path status offset-ms duration-ms]}]
+  (exec! ds ["INSERT OR IGNORE INTO chunks (recording_id, chunk_no, path, status, offset_ms, duration_ms)
+              VALUES (?, ?, ?, ?, ?, ?)"
+             recording-id chunk-no path (or status "pending") offset-ms duration-ms]))
+
+(defn chunk [ds recording-id chunk-no]
+  (q1 ds ["SELECT * FROM chunks WHERE recording_id = ? AND chunk_no = ?" recording-id chunk-no]))
+
+(defn update-chunk! [ds recording-id chunk-no m]
+  (let [cols (keys m)]
+    (doseq [c cols]
+      (when-not (re-matches #"[a-z_]+" (name c)) (throw (ex-info "bad column" {:column c}))))
+    (exec! ds (into [(str "UPDATE chunks SET " (str/join ", " (map #(str (name %) " = ?") cols))
+                          " WHERE recording_id = ? AND chunk_no = ?")]
+                    (concat (vals m) [recording-id chunk-no])))))
+
+(defn claim-chunks!
+  "Mark up to N due pending chunks `uploading` and return them, oldest
+  recording first.  Only chunks of recordings still being worked on."
+  [ds n now-ms]
+  (jdbc/with-transaction [tx ds]
+    (let [cs (jdbc/execute! tx ["SELECT c.* FROM chunks c JOIN recordings r ON r.id = c.recording_id
+                                  WHERE c.status = 'pending' AND c.not_before <= ?
+                                    AND r.status IN ('recording', 'processing')
+                                  ORDER BY r.started_at, c.chunk_no LIMIT ?" now-ms n] opts)]
+      (doseq [c cs]
+        (jdbc/execute! tx ["UPDATE chunks SET status = 'uploading', attempts = attempts + 1
+                             WHERE recording_id = ? AND chunk_no = ?" (:recording_id c) (:chunk_no c)]))
+      (mapv #(update % :attempts inc) cs))))
+
+(defn reset-uploading-chunks! [ds]
+  (exec! ds ["UPDATE chunks SET status = 'pending' WHERE status = 'uploading'"]))
+
+(defn chunk-counts
+  "{:pending :uploading :done :failed :total} for RECORDING-ID."
+  [ds recording-id]
+  (let [rows (q ds ["SELECT status, COUNT(*) AS n FROM chunks WHERE recording_id = ? GROUP BY status"
+                    recording-id])
+        m (into {:pending 0 :uploading 0 :done 0 :failed 0}
+                (map (juxt (comp keyword :status) :n) rows))]
+    (assoc m :total (reduce + (vals m)))))
+
+(defn- insert-segment! [tx recording-id {:keys [chunk_no start_ms end_ms text words speaker]}]
+  (jdbc/execute! tx ["INSERT INTO segments (recording_id, chunk_no, start_ms, end_ms, speaker, text, words)
+                      VALUES (?, ?, ?, ?, ?, ?, ?)"
+                     recording-id chunk_no start_ms end_ms speaker text
+                     (when (seq words) (json/write-value-as-string words))]))
+
+(defn chunk-transcribed!
+  "Store SEGS (maps with :start_ms :end_ms :text :words) as the segments
+  of chunk CHUNK-NO and mark it done, atomically."
+  [ds recording-id chunk-no segs]
+  (jdbc/with-transaction [tx ds]
+    (jdbc/execute! tx ["DELETE FROM segments WHERE recording_id = ? AND chunk_no = ?" recording-id chunk-no])
+    (doseq [s segs] (insert-segment! tx recording-id (assoc s :chunk_no chunk-no)))
+    (jdbc/execute! tx ["UPDATE chunks SET status = 'done', error = NULL WHERE recording_id = ? AND chunk_no = ?"
+                       recording-id chunk-no])))
+
+(defn- decode-segment [s]
+  (update s :words #(if % (json/read-value %) [])))
+
+(defn segments
+  "Segments of RECORDING-ID with id > AFTER, in id order."
+  ([ds recording-id] (segments ds recording-id 0))
+  ([ds recording-id after]
+   (mapv decode-segment
+         (q ds ["SELECT id, chunk_no, start_ms, end_ms, speaker, text, words FROM segments
+                  WHERE recording_id = ? AND id > ? ORDER BY id" recording-id after]))))
+
+(defn segment-count [ds recording-id]
+  (:n (q1 ds ["SELECT COUNT(*) AS n FROM segments WHERE recording_id = ?" recording-id])))
+
+(defn replace-all-segments!
+  "Replace every segment of RECORDING-ID with SEGS (maps with :chunk_no),
+  inserted in start order."
+  [ds recording-id segs]
+  (jdbc/with-transaction [tx ds]
+    (jdbc/execute! tx ["DELETE FROM segments WHERE recording_id = ?" recording-id])
+    (doseq [s (sort-by (juxt :start_ms :chunk_no) segs)]
+      (insert-segment! tx recording-id s))))
+
+(defn delete-transcript! [ds recording-id]
+  (exec! ds ["DELETE FROM segments WHERE recording_id = ?" recording-id])
+  (exec! ds ["DELETE FROM chunks WHERE recording_id = ?" recording-id]))
+
+(defn recordings-in [ds statuses]
+  (q ds (into [(str "SELECT * FROM recordings WHERE status IN ("
+                    (str/join ", " (repeat (count statuses) "?")) ")")]
+              statuses)))

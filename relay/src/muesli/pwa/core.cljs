@@ -31,7 +31,8 @@
 
 ;;;; State
 
-(defonce app (atom {:clients [] :history [] :tab :record :unfinished [] :message nil}))
+(defonce app (atom {:clients [] :history [] :tab :record :unfinished [] :message nil
+                    :sessions [] :session nil}))
 
 (defn- clock [ms]
   (let [s (js/Math.floor (/ (or ms 0) 1000))
@@ -86,6 +87,17 @@
                  nil)))
       (.catch (fn [_] (swap! app assoc :offline true)))))
 
+(defn load-sessions!
+  "Meetings started in Emacs that wait for this phone to record them."
+  []
+  (when (and (not (recorder/recording?)) (= "visible" js/document.visibilityState))
+    (-> (api/request "GET" "/app/api/sessions")
+        (.then (fn [{:keys [status body]}]
+                 (when (= 200 status)
+                   (let [v (vec body)]
+                     (when (not= v (:sessions @app)) (swap! app assoc :sessions v))))))
+        (.catch (fn [_] nil)))))
+
 (defn load-history! []
   (-> (js/Promise.all
        #js [(-> (api/request "GET" "/app/api/recordings")
@@ -138,13 +150,31 @@
                    (when (exists? js/navigator.storage.persist) (.persist js/navigator.storage))))
           (.catch (fn [e] (message! (str "Microphone unavailable: " (.-message e)))))))))
 
+(defn- start-session!
+  "Record the meeting SESS that Emacs is waiting for."
+  [sess]
+  (if-not (recorder/supported?)
+    (message! "This browser cannot record audio.")
+    (-> (recorder/start! {:session (:id sess) :title (:title sess)})
+        (.then (fn [_]
+                 (swap! app assoc :session sess :message nil
+                        :sessions (vec (remove #(= (:id sess) (:id %)) (:sessions @app))))
+                 (when (exists? js/navigator.storage.persist) (.persist js/navigator.storage))))
+        (.catch (fn [e] (message! (str "Microphone unavailable: " (.-message e))))))))
+
 (defn- stop! []
   (-> (recorder/stop! (not-empty (.-value (:notes @ui))))
       (.then (fn [_]
                (set! (.-value (:notes @ui)) "")
                (set! (.-value (:title @ui)) "")
+               (swap! app assoc :session nil)
                (message! "Saved.  Uploading…")
                (load-history!)))))
+
+(defn- stop-requested! [id]
+  (when (and (recorder/recording?) (= id (recorder/current-id)))
+    (-> (stop!)
+        (.then #(message! "Emacs ended the meeting.  Uploading the rest…")))))
 
 (defn- toggle-pause! []
   (if (recorder/paused?) (recorder/resume!) (recorder/pause!)))
@@ -162,13 +192,16 @@
 
 (defn- status-label [r]
   (cond (:reject_reason r) "rejected"
-        (= "ready" (:status r)) "waiting for Emacs"
-        :else (:status r)))
+        :else (case (:status r)
+                "waiting" "waiting for phone"
+                "processing" "transcribing"
+                "transcribed" "waiting for Emacs"
+                (:status r))))
 
 (defn- history-row [r clients]
   (let [chip (status-label r)
         undelivered (not= "delivered" (:status r))
-        assign (when (and undelivered (seq clients))
+        assign (when (and undelivered (not= "emacs" (:origin r)) (seq clients))
                  (let [sel (el :select {:aria-label "Assign to"}
                                (for [c clients p (:profiles c)]
                                  (let [v (str (:id c) "|" (:name p))]
@@ -186,10 +219,11 @@
         (el :div {:class "hist-main"}
             (el :strong {} (or (:title r) "Untitled"))
             (el :span {:class "muted"} " " (when-str (:started_at r)) " · " (clock (:duration_ms r))
-                " · " (or (:client_name r) "unassigned") " / " (:profile r)))
+                " · " (or (:client_name r) "unassigned")
+                (if (= "emacs" (:origin r)) " · started in Emacs" (str " / " (:profile r)))))
         (el :div {:class "hist-side"}
-            (el :span {:class (str "chip " (str/replace chip #" .*" ""))} chip)
-            (when (:reject_reason r) (el :div {:class "muted small"} (:reject_reason r)))
+            (el :span {:class (str "chip " (if (:reject_reason r) "rejected" (:status r)))} chip)
+            (when-let [why (or (:reject_reason r) (:error r))] (el :div {:class "muted small"} why))
             assign
             (when undelivered
               (el :button {:class "link"
@@ -237,8 +271,20 @@
                        (el :button {:class "primary small" :on-click #(recover! r)} "Upload & finish")
                        (el :button {:class "link" :on-click #(discard-local! r)} "Discard")))))))
 
+(defn- render-sessions! []
+  (let [box (:sessions @ui)]
+    (clear! box)
+    (when-not (recorder/recording?)
+      (doseq [sess (:sessions @app)]
+        (.append box
+                 (el :div {:class "banner session"}
+                     (el :span {} (el :strong {} (:client_name sess)) " is waiting: "
+                         (or (:title sess) "Untitled meeting"))
+                     (el :span {:class "banner-actions"}
+                         (el :button {:class "primary small" :on-click #(start-session! sess)} "Record"))))))))
+
 (defn render! []
-  (let [{:keys [clients tab message login-required offline]} @app
+  (let [{:keys [clients tab message login-required offline session]} @app
         u @ui
         rec? (recorder/recording?)
         paused? (recorder/paused?)]
@@ -246,6 +292,13 @@
     (show! (:form u) (seq clients))
     (set! (.-disabled (:client u)) rec?)
     (set! (.-disabled (:profile u)) rec?)
+    (let [for-emacs (and rec? session)]
+      (show! (:pickers u) (not for-emacs))
+      (show! (:title u) (not for-emacs))
+      (show! (:session-title u) for-emacs)
+      (when for-emacs
+        (text! (:session-title u) (str "Recording “" (or (:title session) "Untitled meeting")
+                                       "” for " (:client_name session)))))
     (set! (.-className (:record-btn u)) (str "record " (cond paused? "paused" rec? "on" :else "off")))
     (.setAttribute (:record-btn u) "aria-label" (if rec? "Stop recording" "Start recording"))
     (text! (:record-label u) (if rec? "Stop" "Record"))
@@ -263,6 +316,7 @@
       (show! (get u k) (= tab k))
       (.toggle (.-classList (get u v)) "active" (= tab k)))
     (render-unfinished!)
+    (render-sessions!)
     (when (= tab :history) (render-history!))))
 
 (defn- meter-loop []
@@ -294,6 +348,11 @@
                                                               (load-history!))} "History")
         history-list (el :ul {:class "history"})
         unfinished (el :div {})
+        sessions (el :div {})
+        session-title (el :h2 {:class "session-title" :hidden true})
+        pickers (el :div {:class "pickers"}
+                    (el :label {} "Emacs" client)
+                    (el :label {} "Profile" profile profile-desc))
         notes-wrap (el :label {:hidden true} "Notes" notes)
         lock-hint (el :p {:class "muted small" :hidden true}
                       "Keep this screen open. Locking the phone or switching apps can stop the recording.")
@@ -303,9 +362,8 @@
                       (el :code {} "M-x muesli-relay-link") ".")
                   (el :a {:href "/keys" :class "primary button"} "Create an API key"))
         form (el :div {:class "card recorder"}
-                 (el :div {:class "pickers"}
-                     (el :label {} "Emacs" client)
-                     (el :label {} "Profile" profile profile-desc))
+                 pickers
+                 session-title
                  title
                  (el :div {:class "stage"}
                      timer
@@ -313,13 +371,14 @@
                      (el :div {:class "controls"} record-btn pause-btn))
                  lock-hint
                  notes-wrap)
-        record-view (el :section {} unfinished empty form)
+        record-view (el :section {} unfinished sessions empty form)
         history-view (el :section {:hidden true} (el :div {:class "card"} history-list))]
     (reset! ui {:client client :profile profile :profile-desc profile-desc :title title :notes notes
                 :record-btn record-btn :record-label record-label :pause-btn pause-btn :timer timer
                 :meter meter :status status :login-link login-link :record-tab record-tab
                 :history-tab history-tab :history-list history-list :unfinished unfinished
                 :notes-wrap notes-wrap :lock-hint lock-hint :empty empty :form form
+                :sessions sessions :session-title session-title :pickers pickers
                 :record record-view :history history-view})
     (clear! root)
     (.append root
@@ -339,7 +398,7 @@
     (queue/on-change! (fn [s]
                         (when (:last-finished s)
                           (swap! queue/state dissoc :last-finished)
-                          (message! "Uploaded — waiting for Emacs to fetch it.")
+                          (message! "Uploaded — the relay is transcribing it.")
                           (load-history!))
                         (render!)))
     (js/window.addEventListener "online" (fn [_] (swap! app assoc :offline false)
@@ -347,10 +406,14 @@
     (js/window.addEventListener "offline" (fn [_] (swap! app assoc :offline true)))
     (js/window.addEventListener "beforeunload"
                                 (fn [^js e] (when (recorder/recording?) (.preventDefault e) (set! (.-returnValue e) ""))))
+    (queue/on-stop-requested! stop-requested!)
     (js/setInterval queue/kick! 15000)
+    (js/setInterval load-sessions! 5000)
+    (js/document.addEventListener "visibilitychange" (fn [_] (load-sessions!)))
     (register-sw!)
     (render!)
     (meter-loop)
     (load-clients!)
+    (load-sessions!)
     (find-unfinished!)
     (queue/kick!)))

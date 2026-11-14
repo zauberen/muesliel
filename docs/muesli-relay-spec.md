@@ -1,6 +1,8 @@
 # muesli-relay — Spec 2: record on a phone, hand off to Emacs
 
-Status: v1 implemented (relay/, muesli-relay.el) · 2026-11-13
+Status: v1 implemented (relay/, muesli-relay.el) · 2026-11-13.  The hand-off
+(§3.3, §6.3) is superseded by Spec 3 (`muesli-relay-transcription-spec.md`):
+the relay now transcribes, and Emacs pulls transcripts instead of audio.
 
 ## 1. Summary
 

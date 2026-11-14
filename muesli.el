@@ -64,6 +64,18 @@ A MUESLI_MODE property on the heading overrides this."
   :type '(choice (const room) (const call) (const hybrid))
   :group 'muesli)
 
+(defcustom muesli-recording-source
+  (if (eq system-type 'windows-nt) 'phone 'local)
+  "Where `muesli-start' records.
+`local' records on this machine with ffmpeg (`muesli-recorder-command').
+`phone' records on a phone through the muesli relay, which also
+transcribes; this Emacs then only needs curl and an LLM (see
+`muesli-relay-url').  The default is `phone' on Windows.  With two
+prefix arguments, `muesli-start' uses the other source once."
+  :type '(choice (const :tag "This machine (ffmpeg)" local)
+                 (const :tag "A phone through the relay" phone))
+  :group 'muesli)
+
 (defcustom muesli-mode-line-recording-format "• REC %s"
   "Mode line text while recording; %s is replaced by the elapsed time.
 The default uses U+2022 BULLET, which most fonts center at text
@@ -99,7 +111,9 @@ height; U+25CF BLACK CIRCLE sits on the baseline in many fonts."
 (defvar muesli--recording nil
   "Plist describing the active recording, or nil.
 Keys: :id :title :mode :stop :watch-stop :started :dir :exited
-:stopping :on-exit.")
+:stopping :on-exit.  Phone meetings (see `muesli-relay-start-meeting')
+also have :remote (the relay recording id) and :waiting (no phone has
+started yet).")
 
 (defvar muesli--pipelines (make-hash-table :test #'equal)
   "Map from meeting ID to the pipeline step currently running in this Emacs.")
@@ -118,8 +132,10 @@ Keys: :id :title :mode :stop :watch-stop :started :dir :exited
     (when muesli--recording
       (push (propertize
              (format muesli-mode-line-recording-format
-                     (muesli--format-clock
-                      (* 1000 (- (float-time) (plist-get muesli--recording :started)))))
+                     (if (plist-get muesli--recording :waiting)
+                         "waiting for phone"
+                       (muesli--format-clock
+                        (* 1000 (max 0 (- (float-time) (plist-get muesli--recording :started)))))))
              'face 'error
              'help-echo (format "muesli: recording %s"
                                 (plist-get muesli--recording :title)))
@@ -250,10 +266,28 @@ STATUSES limits the candidates offered when reading."
                            (symbol-name muesli-default-mode))))
 
 ;;;###autoload
-(defun muesli-start (&optional ask-mode)
+(declare-function muesli-relay-start-meeting "muesli-relay" (id info file))
+(declare-function muesli-relay-check-linked "muesli-relay" ())
+(declare-function muesli-relay-await-transcript "muesli-relay" (id))
+(declare-function muesli-relay-resume "muesli-relay" (id &optional skip))
+
+(defun muesli--relay-meeting-p (id)
+  "Return non-nil if meeting ID is recorded and transcribed by the relay."
+  (and id (muesli-db-relay-import-for-meeting id) t))
+
+(defun muesli--recording-source (arg)
+  "Return the recording source for `muesli-start' prefix ARG."
+  (if (equal arg '(16))
+      (if (eq muesli-recording-source 'phone) 'local 'phone)
+    muesli-recording-source))
+
+;;;###autoload
+(defun muesli-start (&optional arg)
   "Start recording the meeting whose heading contains point.
-With prefix argument ASK-MODE, prompt for the capture mode.  Works
-from an org buffer or an active capture buffer."
+With one prefix ARG (\[universal-argument]), prompt for the capture mode.
+With two (\[universal-argument] \[universal-argument]), use the other
+`muesli-recording-source' for this meeting.  Works from an org buffer
+or an active capture buffer."
   (interactive "P")
   (when muesli--recording
     (user-error "Already recording \"%s\"; stop it with `muesli-stop' first"
@@ -262,12 +296,21 @@ from an org buffer or an active capture buffer."
     (user-error "Not in an org buffer"))
   (when (org-before-first-heading-p)
     (user-error "Point is not in a meeting heading"))
-  (muesli--require-executable muesli-ffmpeg-command "recording audio")
+  (let ((source (muesli--recording-source arg)))
+    (if (eq source 'phone)
+        (progn (require 'muesli-relay) (muesli-relay-check-linked))
+      (muesli--require-executable muesli-ffmpeg-command "recording audio"))
+    (muesli--start source (equal arg '(4)))))
+
+(defun muesli--start (source ask-mode)
+  "Start recording the meeting at point from SOURCE (`local' or `phone').
+ASK-MODE non-nil prompts for the capture mode (local recordings only)."
   (save-excursion
     (org-back-to-heading t)
     (let* ((id (org-id-get-create))
            (info (muesli--heading-info))
-           (mode (cond (ask-mode (muesli--read-mode))
+           (mode (cond ((eq source 'phone) 'room)
+                       (ask-mode (muesli--read-mode))
                        ((memq (plist-get info :mode) '(room call hybrid)) (plist-get info :mode))
                        (t muesli-default-mode)))
            (existing (muesli-db-meeting id)))
@@ -278,52 +321,73 @@ from an org buffer or an active capture buffer."
                                      (plist-get existing :status)))
           (user-error "Aborted"))
         (muesli--delete-data id))
-      (when (and (memq mode '(room hybrid)) (eq muesli-diarization-backend 'none))
-        (display-warning 'muesli
-                         (format "Recording in %s mode without a diarization backend: the transcript will have no speaker labels.  Set `muesli-diarization-backend' to fix this."
-                                 mode)
-                         :warning))
-      (let* ((tracks (muesli-record-resolve-devices mode))
-             (dir (expand-file-name (muesli--file-safe id) muesli-audio-directory)))
-        (make-directory dir t)
-        (dolist (f (muesli-record-chunk-files dir)) (delete-file (nth 2 f)))
-        (muesli-db-meeting-create
-         id :file (buffer-file-name (buffer-base-buffer)) :title (plist-get info :title)
-         :category (plist-get info :category) :mode (symbol-name mode)
-         :started_at (truncate (float-time)) :status "recording"
-         :audio_dir dir :chunk_seconds muesli-chunk-seconds)
-        (let* ((state (list :id id :title (plist-get info :title) :mode mode
-                            :started (float-time) :dir dir :tracks tracks))
-               (stop (funcall muesli-recorder-function
-                              :directory dir :tracks tracks
-                              :chunk-seconds muesli-chunk-seconds
-                              :on-exit (lambda (event) (muesli--recorder-exited id event)))))
-          (setq state (plist-put state :stop stop))
-          (setq muesli--recording state)
-          (setq muesli--recording
-                (plist-put muesli--recording :watch-stop
-                           (muesli-record-watch
-                            :directory dir
-                            :finished-p (lambda () (and muesli--recording
-                                                        (plist-get muesli--recording :exited)))
-                            :on-chunk (lambda (track no path)
-                                        (muesli--on-chunk id track no path))))))
-        (muesli--set-tag muesli-recording-tag t)
-        (muesli--mode-line-setup)
-        ;; Refresh every window's mode line, not just the current buffer's.
-        (setq muesli--mode-line-timer
-              (run-at-time 1 1 (lambda () (force-mode-line-update t))))
-        (muesli--message "Recording \"%s\" (%s mode: %s)" (plist-get info :title) mode
-                         (mapconcat (lambda (tr) (format "%s=%s" (car tr)
-                                                         (muesli-record-describe-device (cdr tr))))
-                                    tracks ", "))
-        (dolist (tr tracks)
-          (when (muesli-record-source-muted-p (cdr tr))
-            (display-warning
-             'muesli
-             (format "The %s input %s is MUTED; the recording will be silent.  Unmute it, or pick another source with `muesli-select-device'."
-                     (car tr) (muesli-record-describe-device (cdr tr)))
-             :error)))))))
+      (if (eq source 'phone)
+          (muesli--start-phone id info)
+        (muesli--start-local id info mode)))))
+
+(defun muesli--start-recording-ui (&optional id)
+  "Show that a meeting is being recorded.
+The tag goes on the heading at point, or on meeting ID's heading."
+  (if id
+      (ignore-errors (muesli--with-heading id (muesli--set-tag muesli-recording-tag t)))
+    (muesli--set-tag muesli-recording-tag t))
+  (muesli--mode-line-setup)
+  ;; Refresh every window's mode line, not just the current buffer's.
+  (setq muesli--mode-line-timer
+        (run-at-time 1 1 (lambda () (force-mode-line-update t)))))
+
+(defun muesli--start-phone (id info)
+  "Start meeting ID (heading INFO) recorded on a phone through the relay."
+  (setq muesli--recording
+        (muesli-relay-start-meeting id info (buffer-file-name (buffer-base-buffer))))
+  (muesli--start-recording-ui)
+  (muesli--message "\"%s\" is waiting for the phone: open the muesli relay app and tap Record"
+                   (plist-get info :title)))
+
+(defun muesli--start-local (id info mode)
+  "Start recording meeting ID (heading INFO) on this machine in MODE."
+  (when (and (memq mode '(room hybrid)) (eq muesli-diarization-backend 'none))
+    (display-warning 'muesli
+                     (format "Recording in %s mode without a diarization backend: the transcript will have no speaker labels.  Set `muesli-diarization-backend' to fix this."
+                             mode)
+                     :warning))
+  (let* ((tracks (muesli-record-resolve-devices mode))
+         (dir (expand-file-name (muesli--file-safe id) muesli-audio-directory)))
+    (make-directory dir t)
+    (dolist (f (muesli-record-chunk-files dir)) (delete-file (nth 2 f)))
+    (muesli-db-meeting-create
+     id :file (buffer-file-name (buffer-base-buffer)) :title (plist-get info :title)
+     :category (plist-get info :category) :mode (symbol-name mode)
+     :started_at (truncate (float-time)) :status "recording"
+     :audio_dir dir :chunk_seconds muesli-chunk-seconds)
+    (let* ((state (list :id id :title (plist-get info :title) :mode mode
+                        :started (float-time) :dir dir :tracks tracks))
+           (stop (funcall muesli-recorder-function
+                          :directory dir :tracks tracks
+                          :chunk-seconds muesli-chunk-seconds
+                          :on-exit (lambda (event) (muesli--recorder-exited id event)))))
+      (setq state (plist-put state :stop stop))
+      (setq muesli--recording state)
+      (setq muesli--recording
+            (plist-put muesli--recording :watch-stop
+                       (muesli-record-watch
+                        :directory dir
+                        :finished-p (lambda () (and muesli--recording
+                                                    (plist-get muesli--recording :exited)))
+                        :on-chunk (lambda (track no path)
+                                    (muesli--on-chunk id track no path))))))
+    (muesli--start-recording-ui)
+    (muesli--message "Recording \"%s\" (%s mode: %s)" (plist-get info :title) mode
+                     (mapconcat (lambda (tr) (format "%s=%s" (car tr)
+                                                     (muesli-record-describe-device (cdr tr))))
+                                tracks ", "))
+    (dolist (tr tracks)
+      (when (muesli-record-source-muted-p (cdr tr))
+        (display-warning
+         'muesli
+         (format "The %s input %s is MUTED; the recording will be silent.  Unmute it, or pick another source with `muesli-select-device'."
+                 (car tr) (muesli-record-describe-device (cdr tr)))
+         :error)))))
 
 (defun muesli--check-chunk-level (id track path)
   "Warn if the first chunk of TRACK at PATH in meeting ID is silent."
@@ -471,10 +535,14 @@ The org heading itself is left alone."
 ;;;;; Transcribing
 
 (defun muesli--step-transcribe (id)
-  "Wait until all chunks of meeting ID are transcribed."
+  "Wait until all chunks of meeting ID are transcribed.
+For a phone meeting the relay transcribes and diarizes; wait for it."
   (muesli--set-step id "transcribing")
-  (muesli-stt-run-queue)
-  (muesli--check-transcribed id))
+  (if (muesli--relay-meeting-p id)
+      (progn (require 'muesli-relay)
+             (muesli-relay-await-transcript id))
+    (muesli-stt-run-queue)
+    (muesli--check-transcribed id)))
 
 (defun muesli--check-transcribed (id)
   "Move meeting ID on once no chunk is pending or uploading."
@@ -716,31 +784,39 @@ With prefix argument SKIP, skip the step that failed."
   (let* ((meeting (muesli-db-meeting id))
          (status (plist-get meeting :status))
          (step (if (equal status "failed") (plist-get meeting :failed_step) status)))
-    (when (equal status "recording")
-      (muesli--register-chunks-from-disk id)
-      (unless (plist-get meeting :ended_at)
-        (muesli-db-meeting-update
-         id :ended_at (truncate (or (when-let* ((f (car (last (muesli-record-chunk-files
-                                                                (plist-get meeting :audio_dir))))))
-                                      (float-time (file-attribute-modification-time
-                                                   (file-attributes (nth 2 f)))))
-                                    (float-time)))))
-      (setq step "transcribing"))
-    (muesli-db-chunks-reset-uploading)
-    (when (equal step "transcribing")
-      (muesli-stt-retry-failed id))
-    (when (equal step "applying")
-      (if skip (setq step "done")
-        (let ((summary (plist-get meeting :summary)))
-          (muesli--set-step id "summarizing")
-          (setq step nil)
-          (muesli--apply-summary id summary
-                                 (muesli--with-heading id (muesli-org-body))
-                                 t 0))))
-    (when (and skip step) (setq step (muesli--next-step step)))
-    (when step
-      (muesli--message "Resuming \"%s\" at %s" (plist-get meeting :title) step)
-      (muesli--advance id step))))
+    (if (and (member step '("recording" "transcribing" "diarizing"))
+             (muesli--relay-meeting-p id))
+        (progn (require 'muesli-relay)
+               (muesli-relay-resume id skip))
+      (muesli--resume-local id meeting status step skip))))
+
+(defun muesli--resume-local (id meeting status step skip)
+  "Resume meeting ID (row MEETING, STATUS) at STEP; SKIP skips it."
+  (when (equal status "recording")
+    (muesli--register-chunks-from-disk id)
+    (unless (plist-get meeting :ended_at)
+      (muesli-db-meeting-update
+       id :ended_at (truncate (or (when-let* ((f (car (last (muesli-record-chunk-files
+                                                             (plist-get meeting :audio_dir))))))
+                                    (float-time (file-attribute-modification-time
+                                                 (file-attributes (nth 2 f)))))
+                                  (float-time)))))
+    (setq step "transcribing"))
+  (muesli-db-chunks-reset-uploading)
+  (when (equal step "transcribing")
+    (muesli-stt-retry-failed id))
+  (when (equal step "applying")
+    (if skip (setq step "done")
+      (let ((summary (plist-get meeting :summary)))
+        (muesli--set-step id "summarizing")
+        (setq step nil)
+        (muesli--apply-summary id summary
+                               (muesli--with-heading id (muesli-org-body))
+                               t 0))))
+  (when (and skip step) (setq step (muesli--next-step step)))
+  (when step
+    (muesli--message "Resuming \"%s\" at %s" (plist-get meeting :title) step)
+    (muesli--advance id step)))
 
 ;;;###autoload
 (defun muesli-regenerate (id)

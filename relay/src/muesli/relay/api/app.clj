@@ -7,9 +7,11 @@
             [ring.middleware.anti-forgery]))
 
 (def CreateBody
+  "Creates a phone recording, or claims a waiting one (then client_id and
+  profile may be left out)."
   [:map
-   [:client_id [:re http/uuid-re]]
-   [:profile [:string {:min 1 :max 64}]]
+   [:client_id {:optional true} [:maybe [:re http/uuid-re]]]
+   [:profile {:optional true} [:maybe [:string {:min 1 :max 64}]]]
    [:title {:optional true} [:maybe [:string {:max 300}]]]
    [:mime_type [:string {:min 1 :max 100}]]
    [:started_at :int]])
@@ -44,6 +46,9 @@
 (defn clients [{:keys [ds]} req]
   (http/ok (mapv #(select-keys % [:id :name :profiles :last_seen_at])
                  (db/clients-for-user ds (:id (user req))))))
+
+(defn sessions [{:keys [ds]} req]
+  (http/ok (db/waiting-for-user ds (:id (user req)))))
 
 (defn me [_ req]
   (http/ok {:username (:username (user req))
@@ -84,6 +89,7 @@
   ["/app/api" {:middleware [auth/require-user-json]}
    ["/me" {:get #(me ctx %)}]
    ["/clients" {:get #(clients ctx %)}]
+   ["/sessions" {:get #(sessions ctx %)}]
    ["/recordings" {:get #(history ctx %)}]
    ["/recordings/:id" {:middleware [with-id]
                        :put #(create ctx %)

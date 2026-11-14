@@ -23,6 +23,32 @@
 
  :signup-enabled #boolean #or [#env RELAY_SIGNUP "false"]
 
+ ;; Speech to text (Spec 3).  The same OpenAI-compatible server muesli
+ ;; uses locally, e.g. LocalAI serving Parakeet.
+ :ffmpeg #or [#env RELAY_FFMPEG "ffmpeg"]
+ :transcription {:base-url #or [#env RELAY_STT_URL "http://localhost:8080/v1"]
+                 :model #or [#env RELAY_STT_MODEL "parakeet-tdt-0.6b-v3"]
+                 :api-key #env RELAY_STT_API_KEY
+                 :language #env RELAY_STT_LANGUAGE
+                 :extra-fields {}
+                 :chunk-seconds #long #or [#env RELAY_CHUNK_SECONDS 30]
+                 :concurrency #long #or [#env RELAY_STT_CONCURRENCY 1]
+                 :max-attempts 4
+                 :retry-delay-seconds 5
+                 :timeout-seconds 600}
+
+ ;; :none, :localai (/audio/diarization) or :diarized-json.
+ :diarization {:backend #keyword #or [#env RELAY_DIARIZATION "none"]
+               :base-url #env RELAY_DIARIZATION_URL ; unset: same as :transcription
+               :model #or [#env RELAY_DIARIZATION_MODEL "parakeet-cpp-nemotron-3-diarization"]
+               :api-key #env RELAY_DIARIZATION_API_KEY
+               :split-threshold 0.3
+               :timeout-seconds 3600}
+
+ ;; After Emacs asks to stop, finish without the phone once it has sent
+ ;; nothing for this long.
+ :recording {:phone-gone-seconds 60}
+
  :retention {:after-ack-hours 0
              :abandon-after-hours 24
              :purge-abandoned-days 14

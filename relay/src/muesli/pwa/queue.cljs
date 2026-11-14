@@ -11,6 +11,17 @@
 (defonce listeners (atom #{}))
 
 (defn on-change! [f] (swap! listeners conj f))
+
+(defonce stop-handler (atom nil))
+
+(defn on-stop-requested!
+  "Call F with a recording id when Emacs asks for that recording to stop."
+  [f]
+  (reset! stop-handler f))
+
+(def refused
+  "Statuses that will not change on retry: keep the audio, show why."
+  #{410 415 422})
 (defn- notify! [] (doseq [f @listeners] (f @state)))
 
 (defn- set-progress! [rid m]
@@ -33,14 +44,17 @@
   (if (.-created rec)
     (js/Promise.resolve rec)
     (-> (api/request "PUT" (str "/app/api/recordings/" (.-id rec))
-                     {:client_id (.-client_id rec) :profile (.-profile rec)
-                      :title (.-title rec) :mime_type (.-mime_type rec)
-                      :started_at (.-started_at rec)})
+                     (if (.-session rec)
+                       ;; Claims the meeting Emacs created; it chose the rest.
+                       {:mime_type (.-mime_type rec) :started_at (.-started_at rec)}
+                       {:client_id (.-client_id rec) :profile (.-profile rec)
+                        :title (.-title rec) :mime_type (.-mime_type rec)
+                        :started_at (.-started_at rec)}))
         (.then (fn [{:keys [status body]}]
                  (if (= 200 status)
                    (do (set! (.-created rec) true)
                        (.then (idb/put! "recordings" rec) (constantly rec)))
-                   (if (#{415 422} status)
+                   (if (refused status)
                      ;; Not retryable: keep the audio, show the reason.
                      (do (set-progress! (.-id rec) {:error (get-in body [:error :message])})
                          (fail! status))
@@ -49,9 +63,11 @@
 (defn- upload-part [^js rec ^js part]
   (-> (api/request "PUT" (str "/app/api/recordings/" (.-id rec) "/parts/" (.-seq part))
                    (.-blob part) {"X-Part-SHA256" (.-sha part)})
-      (.then (fn [{:keys [status]}]
+      (.then (fn [{:keys [status body]}]
                (if (= 200 status)
-                 (do (set! (.-uploaded part) true)
+                 (do (when (and (:stop_requested body) @stop-handler)
+                       (@stop-handler (.-id rec)))
+                     (set! (.-uploaded part) true)
                      (idb/put! "parts" part))
                  (fail! status))))))
 
@@ -121,7 +137,7 @@
                                        (.catch (fn [e]
                                                  ;; A refused recording keeps its audio and
                                                  ;; shows its error, but does not block others.
-                                                 (when-not (#{415 422} (:status (ex-data e)))
+                                                 (when-not (refused (:status (ex-data e)))
                                                    (throw e)))))))
                        (js/Promise.resolve nil)
                        (sort-by #(.-started_at ^js %) recs))))))

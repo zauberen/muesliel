@@ -62,9 +62,10 @@
     (catch :default _ [nil nil])))
 
 (defn start!
-  "Ask for the mic and start recording into a new recording with META
-  {:client_id :profile :title}.  Resolves to the recording id."
-  [{:keys [client_id profile title]}]
+  "Ask for the mic and start recording with META {:client_id :profile
+  :title}, or {:session id :title} to record into a meeting Emacs is
+  waiting for.  Resolves to the recording id."
+  [{:keys [client_id profile title session]}]
   (-> (js/navigator.mediaDevices.getUserMedia
        #js {:audio #js {:echoCancellation false :noiseSuppression false
                         :autoGainControl true :channelCount 1}})
@@ -73,7 +74,7 @@
          (let [mime (pick-type)
                rec (js/MediaRecorder. stream (clj->js (cond-> {:audioBitsPerSecond 32000}
                                                         (seq mime) (assoc :mimeType mime))))
-               id (str (random-uuid))
+               id (or session (str (random-uuid)))
                now (js/Date.now)
                [actx an] (setup-meter stream)]
            (reset! current {:rec rec :stream stream :id id :seq 0 :started now
@@ -89,6 +90,7 @@
            (request-wake-lock!)
            (-> (idb/put! "recordings"
                          #js {:id id :client_id client_id :profile profile :title title
+                              :session (boolean session)
                               :mime_type (or (not-empty (.-mimeType rec)) mime "audio/webm")
                               :started_at now :created false :stopped false})
                (.then (fn [] (queue/kick!) id))))))))

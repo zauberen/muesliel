@@ -8,6 +8,7 @@
             [muesli.relay.config :as config]
             [muesli.relay.db :as db]
             [muesli.relay.handler :as handler]
+            [muesli.relay.pipeline :as pipeline]
             [muesli.relay.sweeper :as sweeper]
             [ring.adapter.jetty :as jetty]))
 
@@ -16,7 +17,19 @@
 (defmethod ig/init-key :relay/db [_ {:keys [cfg]}]
   (db/datasource (get-in cfg [:db :file])))
 
+(defmethod ig/init-key :relay/pipeline-state [_ _] (pipeline/state {}))
+
 (defmethod ig/init-key :relay/ctx [_ ctx] ctx)
+
+(defmethod ig/init-key :relay/pipeline [_ {:keys [ctx]}]
+  (log/info (format "transcribing with %s (%s), diarization %s"
+                    (get-in ctx [:cfg :transcription :base-url])
+                    (get-in ctx [:cfg :transcription :model])
+                    (name (get-in ctx [:cfg :diarization :backend] :none))))
+  {:ctx ctx :scheduler (pipeline/start ctx)})
+
+(defmethod ig/halt-key! :relay/pipeline [_ {:keys [ctx scheduler]}]
+  (pipeline/stop ctx scheduler))
 
 (defmethod ig/init-key :relay/server [_ {:keys [ctx]}]
   (let [{:keys [host port]} (get-in ctx [:cfg :http])
@@ -34,7 +47,9 @@
 
 (defn system-config [cfg]
   {:relay/db {:cfg cfg}
-   :relay/ctx {:cfg cfg :ds (ig/ref :relay/db)}
+   :relay/pipeline-state {}
+   :relay/ctx {:cfg cfg :ds (ig/ref :relay/db) :pipeline (ig/ref :relay/pipeline-state)}
+   :relay/pipeline {:ctx (ig/ref :relay/ctx)}
    :relay/server {:ctx (ig/ref :relay/ctx)}
    :relay/sweeper {:ctx (ig/ref :relay/ctx)}})
 

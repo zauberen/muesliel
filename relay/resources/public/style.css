@@ -131,3 +131,9 @@ td.actions select { width: auto; margin: 0; padding: 4px 6px; }
 .hist-main { display: flex; flex-direction: column; min-width: 0; }
 .hist-side { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
 .hist-side select { width: auto; margin: 0; padding: 4px 6px; font-size: .85em; }
+
+/* Meetings started in Emacs (Spec 3) */
+.banner.session { border-left: 4px solid var(--warn-ink); }
+.session-title { font-size: 1.05rem; margin: 0 0 .75rem; text-align: center; }
+.chip.processing, .chip.transcribed { background: var(--warn-bg); color: var(--warn-ink); }
+.chip.failed { background: var(--bad-bg); color: var(--bad-ink); }

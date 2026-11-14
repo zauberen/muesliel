@@ -3,8 +3,9 @@
 ;;; Commentary:
 
 ;; emacs -Q --batch -L <repo> -l e2e.el --eval '(muesli-e2e "link")'
-;; Environment: RELAY_URL, RELAY_KEY, E2E_DIR.  Transcription and
-;; summary are faked; everything else (HTTP, ffmpeg, SQLite, org) is real.
+;; Environment: RELAY_URL, RELAY_KEY, E2E_DIR.  The summary is faked;
+;; transcription happens on the relay (against e2e/fake_stt.py).  This
+;; Emacs never runs ffmpeg: `muesli-ffmpeg-command' points nowhere.
 
 ;;; Code:
 
@@ -37,16 +38,9 @@
          (muesli-relay-profiles '((default :label "Meeting")
                                   (standup :label "Daily standup" :category "Work"
                                            :attendees ("Ann" "Bob"))))
-         (muesli-chunk-seconds 5)
-         (muesli-keep-audio t)
+         (muesli-ffmpeg-command "/nonexistent/ffmpeg")
+         (muesli-relay-live-interval 1)
          (muesli-skip-naming t)
-         (muesli-diarization-backend 'none)
-         (muesli-stt-transcribe-function
-          (lambda (file cb)
-            (run-at-time 0.01 nil cb
-                         `(:ok ((text . ,(file-name-base file))
-                                (segments . (((start . 0.0) (end . 1.0)
-                                              (text . ,(concat "heard " (file-name-base file)))))))))))
          (muesli-summary-function-override
           (lambda (_prompt cb) (run-at-time 0.01 nil cb '(:ok "* Summary\nRecorded on the phone.")))))
     (make-directory muesli-data-directory t)
@@ -76,12 +70,15 @@
                     120)
              (muesli-e2e--die "pipeline did not finish: %S" (muesli-db-meeting (plist-get m :id))))
            (let* ((m (muesli-db-meeting (plist-get m :id)))
-                  (chunks (muesli-db-chunks (plist-get m :id))))
-             (princ (format "MEETING %s %S chunks=%d duration=%ss\n"
-                            (plist-get m :status) (plist-get m :title) (length chunks)
+                  (segs (muesli-db-segments (plist-get m :id))))
+             (princ (format "MEETING %s %S segments=%d speakers=%S duration=%ss\n"
+                            (plist-get m :status) (plist-get m :title) (length segs)
+                            (delete-dups (mapcar (lambda (s) (plist-get s :speaker)) segs))
                             (- (plist-get m :ended_at) (plist-get m :started_at))))
-             (when (< (length chunks) 2)
-               (muesli-e2e--die "expected several chunks, got %d" (length chunks)))))
+             (unless (and (>= (length segs) 2)
+                          (seq-every-p (lambda (s) (string-prefix-p "heard mic-" (plist-get s :text))) segs)
+                          (seq-every-p (lambda (s) (equal (plist-get s :speaker) "mic:SPEAKER_00")) segs))
+               (muesli-e2e--die "expected several diarized relay segments, got %S" segs))))
          (princ "ORG\n")
          (with-current-buffer (find-buffer-visiting muesli-meetings-file)
            (princ (buffer-string))
@@ -89,6 +86,45 @@
                       (cl-count-if (lambda (_) t)
                                    (split-string (buffer-string) "Recorded on the phone\\." t)
                                    :start 1))
-             (muesli-e2e--die "summary not applied to the heading"))))))))
+             (muesli-e2e--die "summary not applied to the heading"))))
+        ("meeting"
+         ;; Spec 3: start the meeting here, record on the phone.
+         (muesli-relay--load-state)
+         (with-temp-file muesli-meetings-file
+           (insert "* Meetings\n** Work\n*** [2026-11-14 Sat] Standup from Emacs\n"
+                   ":PROPERTIES:\n:ATTENDEES: Ann, Bob\n:END:\n- typed in Emacs\n"))
+         (with-current-buffer (find-file-noselect muesli-meetings-file)
+           (goto-char (point-min))
+           (re-search-forward "Standup from Emacs")
+           (let ((muesli-recording-source 'phone)) (muesli-start)))
+         (let ((id (plist-get muesli--recording :id)))
+           (princ (format "WAITING %s\n" (muesli--mode-line-string)))
+           (unless (muesli-e2e--wait (lambda () (not (plist-get muesli--recording :waiting))) 90)
+             (muesli-e2e--die "no phone picked up the meeting"))
+           (princ "PHONE STARTED\n")
+           ;; Live transcript: at least two 5 s chunks while still recording.
+           (unless (muesli-e2e--wait (lambda () (>= (length (muesli-db-segments id)) 2)) 90)
+             (muesli-e2e--die "no live segments: %s"
+                              (with-current-buffer (get-buffer-create "*muesli-log*") (buffer-string))))
+           (princ (format "LIVE %d segments while recording; %s\n"
+                          (length (muesli-db-segments id)) (muesli--mode-line-string)))
+           (muesli-stop)
+           (unless (muesli-e2e--wait
+                    (lambda () (equal (plist-get (muesli-db-meeting id) :status) "done")) 180)
+             (muesli-e2e--die "meeting did not finish: %S\n%s" (muesli-db-meeting id)
+                              (with-current-buffer (get-buffer-create "*muesli-log*") (buffer-string))))
+           (let ((m (muesli-db-meeting id))
+                 (segs (muesli-db-segments id)))
+             (princ (format "MEETING %s segments=%d speakers=%S\n" (plist-get m :status) (length segs)
+                            (mapcar (lambda (s) (plist-get s :label)) (muesli-db-speakers id))))
+             (unless (string-search "Phone-side note." (plist-get m :notes_raw))
+               (muesli-e2e--die "phone notes missing from %S" (plist-get m :notes_raw)))
+             (unless (equal (mapcar (lambda (s) (plist-get s :label)) (muesli-db-speakers id))
+                            '("mic:SPEAKER_00"))
+               (muesli-e2e--die "expected the relay's speaker labels")))
+           (with-current-buffer (find-buffer-visiting muesli-meetings-file)
+             (princ (buffer-string))
+             (unless (string-search "Recorded on the phone." (buffer-string))
+               (muesli-e2e--die "summary not applied")))))))))
 
 ;;; e2e.el ends here

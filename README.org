@@ -32,10 +32,16 @@ If Emacs exits mid-meeting, the next load offers to resume from whatever chunks 
 * Requirements
 
 - Emacs 29.1 or newer, built with SQLite (=(sqlite-available-p)= returns =t=).
-- =ffmpeg= and =curl=.
+- =curl=.
+- An LLM: any OpenAI-compatible chat server (Ollama, llama.cpp, LocalAI, vLLM), the =claude= CLI, or an agent-shell agent.
+
+To record on this machine you also need:
+
+- =ffmpeg=.
 - Linux with PipeWire or PulseAudio (=pactl= is used to find the monitor source for system audio). Other platforms only need a preset in =muesli-recorder-command=.
 - A speech-to-text server with an OpenAI-compatible =/v1/audio/transcriptions= endpoint, for example [[https://localai.io][LocalAI]] serving Parakeet.
-- An LLM: any OpenAI-compatible chat server (Ollama, llama.cpp, LocalAI, vLLM), the =claude= CLI, or an agent-shell agent.
+
+To record on a phone instead, the [[*Recording on a phone (muesli-relay)][relay]] needs the speech server and ffmpeg, and Emacs needs nothing else. This is how muesli runs on Windows.
 
 * Installation
 
@@ -164,7 +170,11 @@ Other options worth knowing: =muesli-action-item-style= (=checkbox= or =todo=), 
 
 * Recording on a phone (muesli-relay)
 
-=relay/= is a small self-hosted Clojure service with an installable web app. You record on your phone, and the recording waits on the relay until this Emacs fetches it and runs it through the normal pipeline. Emacs only makes outbound requests, so the relay can run on the same machine or anywhere else. See =relay/README.md= to run it and =docs/muesli-relay-spec.md= for the design.
+=relay/= is a small self-hosted Clojure service with an installable web app. The phone records, and the relay cuts the audio into chunks, transcribes them while the meeting is still going, and diarizes the result. Emacs keeps only the parts that need you: naming speakers, summarizing with your notes, and writing the heading. Emacs only makes outbound requests, so the relay can run on the same machine or anywhere else. See =relay/README.md= to run it, and =docs/muesli-relay-spec.md= and =docs/muesli-relay-transcription-spec.md= for the design.
+
+Because Emacs never touches audio here, this also works on Windows: Emacs 29+ for Windows includes SQLite, and Windows 10+ includes =curl.exe=.
+
+** Setup
 
 1. On the relay's web page, open *API keys* and create a key, then store it:
    #+begin_src text
@@ -177,17 +187,34 @@ Other options worth knowing: =muesli-action-item-style= (=checkbox= or =todo=), 
      :commands (muesli-relay-link muesli-relay-fetch muesli-relay-status)
      :custom
      (muesli-relay-url "https://relay.example")
-     (muesli-relay-poll-interval 300)            ; or nil and fetch by hand
+     (muesli-recording-source 'phone)            ; the default on Windows
+     (muesli-relay-poll-interval 300)            ; for recordings started on the phone
      (muesli-relay-profiles
       '((default :label "Meeting")
         (standup :label "Daily standup" :category "Team Sync"
                  :title "Standup %F" :attendees ("Ann" "Bob" "Me")))))
    #+end_src
    Then run =M-x muesli-relay-link=. Run it again whenever you change the profiles.
-3. On the phone, open the relay, log in and use "Add to Home Screen". Pick this Emacs and a profile, then record.
-4. =M-x muesli-relay-fetch= (or the poll timer) imports each finished recording as a meeting heading under =* Meetings= / =** <category>=, with the notes typed on the phone as its body. It is split into =muesli-chunk-seconds= chunks on the =mic= track (room mode), then transcribed, diarized and summarized like a local recording. =M-x muesli-relay-status= shows how many recordings are waiting.
+3. On the phone, open the relay, log in and use "Add to Home Screen".
 
-The relay deletes its copy of the audio once Emacs confirms the import. If a recording names a profile this Emacs no longer has, it is rejected: the phone shows why, and you can reassign it there.
+** Start in Emacs, record on the phone
+
+This is the usual way: your notes stay in the org heading.
+
+1. =M-x muesli-start= in a meeting heading. With =muesli-recording-source= set to =phone= (or =C-u C-u M-x muesli-start= for one meeting), Emacs registers the meeting with the relay. The mode line shows =• REC waiting for phone=.
+2. The phone app shows /<this Emacs> is waiting: <title>/. Tap its *Record* button. The mode line clock starts, and =M-x muesli-show-transcript= fills in as the relay transcribes each 30 s chunk.
+3. Type notes in the heading as usual.
+4. =M-x muesli-stop= in Emacs (or *Stop* on the phone). The phone stops and uploads what is left. The relay finishes the transcript and diarizes it (using the =ATTENDEES= count as a hint). Emacs then asks you to name the speakers and replaces the heading body with the summary, the same as for a local recording.
+
+=M-x muesli-abort= deletes the recording on the relay as well. If the relay reports a failure, Emacs offers to retry, to continue without the failed step, or to stop (=muesli-resume= continues later). If Emacs restarts during a phone meeting, =muesli-resume= reattaches to it.
+
+** Start on the phone
+
+Pick this Emacs and a profile in the app and record. Once the relay has transcribed the recording, =M-x muesli-relay-fetch= (or the poll timer) imports it as a heading under =* Meetings= / =** <category>=, with the notes typed on the phone as its body, and runs naming and summarizing. =M-x muesli-relay-status= shows how many recordings are waiting.
+
+If a recording names a profile this Emacs no longer has, it is rejected: the phone shows why, and you can reassign it there.
+
+The relay deletes the audio and the transcript once Emacs confirms it has them.
 
 * Storage
 

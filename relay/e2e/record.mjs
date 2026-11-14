@@ -1,6 +1,6 @@
 // Drive the PWA in headless Chrome with a fake microphone:
 // log in, pick the e2e Emacs, record for a few seconds, stop, and wait
-// until the recording is uploaded and waiting for Emacs.
+// until the recording is uploaded and transcribed by the relay.
 //
 // node record.mjs   (env: RELAY_URL, E2E_USER, E2E_PASS, CHROME, SECONDS)
 import { chromium } from "playwright-core";
@@ -42,9 +42,9 @@ for (let i = 0; i < 40; i++) {
 await page.screenshot({ path: process.env.E2E_DIR + "/pwa-recording.png" });
 await page.click("button.record");
 
-await page.waitForFunction(() => /waiting for Emacs/.test(document.querySelector(".status").textContent), null, { timeout: 30000 });
+await page.waitForFunction(() => /transcribing/.test(document.querySelector(".status").textContent), null, { timeout: 30000 });
 await page.click("button.tab:nth-child(2)");
-await page.waitForSelector(".chip.waiting");
+await page.waitForSelector(".chip.processing, .chip.transcribed");
 await page.screenshot({ path: process.env.E2E_DIR + "/pwa-history.png" });
 
 // Scenario 2: the network drops mid-recording and returns after Stop.
@@ -60,7 +60,7 @@ await page.waitForFunction(() => /Waiting to upload|Uploading/.test(document.que
 const offlineStatus = await page.textContent(".status");
 await page.screenshot({ path: process.env.E2E_DIR + "/pwa-offline.png" });
 await context.setOffline(false);
-await page.waitForFunction(() => /waiting for Emacs/.test(document.querySelector(".status").textContent), null, { timeout: 90000 });
+await page.waitForFunction(() => /transcribing/.test(document.querySelector(".status").textContent), null, { timeout: 90000 });
 
 // Scenario 3: the tab is killed mid-recording, then reopened and recovered.
 await page.selectOption("#profile", "default");
@@ -75,11 +75,17 @@ await page2.goto(url + "/");
 await page2.waitForSelector(".banner button.primary", { timeout: 15000 });
 await page2.screenshot({ path: process.env.E2E_DIR + "/pwa-unfinished.png" });
 await page2.click(".banner button.primary");
-await page2.waitForFunction(() => /waiting for Emacs/.test(document.querySelector(".status").textContent), null, { timeout: 60000 });
+await page2.waitForFunction(() => /transcribing/.test(document.querySelector(".status").textContent), null, { timeout: 60000 });
 
-const recs = await page2.evaluate(async () => (await (await fetch("/app/api/recordings")).json()));
-const summary = recs.map((r) => ({ title: r.title, status: r.status, ms: r.duration_ms, parts: r.part_count }));
-const allReady = recs.length === 3 && recs.every((r) => r.status === "ready" && r.part_count >= 2);
+// The relay transcribes all three (Spec 3) before Emacs fetches them.
+let recs = [];
+for (let i = 0; i < 120; i++) {
+  recs = await page2.evaluate(async () => (await (await fetch("/app/api/recordings")).json()));
+  if (recs.length === 3 && recs.every((r) => r.status !== "processing")) break;
+  await page2.waitForTimeout(500);
+}
+const summary = recs.map((r) => ({ title: r.title, status: r.status, ms: r.duration_ms, parts: r.part_count, error: r.error }));
+const allReady = recs.length === 3 && recs.every((r) => r.status === "transcribed" && r.part_count >= 2);
 
 const loginShown = await page2.isVisible("a[href='/login']");
 const sw = await page2.evaluate(async () => !!(await navigator.serviceWorker.getRegistration()));

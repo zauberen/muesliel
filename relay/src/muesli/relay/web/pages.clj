@@ -255,13 +255,12 @@
 ;;;; Recordings
 
 (defn- status-chip [r]
-  (let [s (cond (:reject_reason r) "rejected"
-                (= "ready" (:status r)) "waiting"
-                :else (:status r))]
+  (let [s (if (:reject_reason r) "rejected" (:status r))]
     [:span {:class (str "chip " s)}
      (case s
-       "waiting" "waiting for Emacs"
-       "rejected" "rejected"
+       "waiting" "waiting for phone"
+       "processing" "transcribing"
+       "transcribed" "waiting for Emacs"
        s)]))
 
 (defn recordings-page [{:keys [ds] :as ctx} req]
@@ -280,14 +279,16 @@
                  [:tr
                   [:td (when-str (:started_at r))]
                   [:td (or (:title r) [:span.muted "untitled"])]
-                  [:td (or (:client_name r) [:span.muted "unassigned"]) " · " [:code (:profile r)]]
+                  [:td (or (:client_name r) [:span.muted "unassigned"]) " · "
+                   (if (= "emacs" (:origin r)) [:span.muted "started in Emacs"] [:code (:profile r)])]
                   [:td (clock (:duration_ms r))]
                   [:td (size (:bytes r))]
-                  [:td (status-chip r) (when (:reject_reason r) [:div.muted.small (:reject_reason r)])]
+                  [:td (status-chip r)
+                   (when-let [why (or (:reject_reason r) (:error r))] [:div.muted.small why])]
                   [:td.actions
                    (when (recs/audio-file ctx r)
                      [:a {:href (str "/recordings/" (:id r) "/audio")} "Download"])
-                   (when (and (not= "delivered" (:status r)) (seq cs))
+                   (when (and (not= "delivered" (:status r)) (not= "emacs" (:origin r)) (seq cs))
                      [:form.inline {:method "post" :action (str "/recordings/" (:id r) "/assign")}
                       (csrf-field)
                       [:select {:name "target"}

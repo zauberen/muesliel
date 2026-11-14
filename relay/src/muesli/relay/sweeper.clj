@@ -1,8 +1,10 @@
 (ns muesli.relay.sweeper
-  "Periodic cleanup: delete delivered audio after the retention period,
-  mark stalled recordings abandoned, purge old abandoned ones."
+  "Periodic cleanup: delete delivered audio and transcripts after the
+  retention period, mark stalled or never-started recordings abandoned,
+  purge old abandoned ones."
   (:require [clojure.tools.logging :as log]
             [muesli.relay.db :as db]
+            [muesli.relay.pipeline :as pipeline]
             [muesli.relay.recordings :as recs]
             [muesli.relay.storage :as storage])
   (:import (java.util.concurrent Executors ScheduledExecutorService TimeUnit)))
@@ -15,12 +17,15 @@
   (let [{:keys [after-ack-hours abandon-after-hours purge-abandoned-days]} (:retention cfg)
         delivered (db/q ds ["SELECT * FROM recordings WHERE status = 'delivered' AND audio_deleted = 0
                               AND delivered_at < ?" (- now (* hour after-ack-hours))])
-        stalled (db/q ds ["SELECT id FROM recordings WHERE status = 'recording' AND last_part_at < ?"
+        stalled (db/q ds ["SELECT id FROM recordings WHERE status IN ('recording', 'waiting')
+                             AND last_part_at < ?"
                           (- now (* hour abandon-after-hours))])
         purge (db/q ds ["SELECT * FROM recordings WHERE status = 'abandoned' AND last_part_at < ?"
                         (- now (* 24 hour purge-abandoned-days))])]
     (doseq [r delivered] (recs/delete-audio! ctx r))
-    (doseq [{:keys [id]} stalled] (db/update-recording! ds id {:status "abandoned"}))
+    (doseq [{:keys [id]} stalled]
+      (pipeline/drop-recording! ctx id)
+      (db/update-recording! ds id {:status "abandoned"}))
     (doseq [r purge]
       (storage/delete-recording-files! (get-in cfg [:storage :dir]) (:user_id r) (:id r))
       (db/delete-recording! ds (:id r)))
