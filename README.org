@@ -1,0 +1,169 @@
+#+title: muesli.el: local meeting notes for Emacs and org-mode
+
+muesli records a meeting while you type rough notes under an org heading. It transcribes the audio on a local speech server, separates speakers where it can, and replaces the heading body with clean notes written by an LLM. Your original notes are kept and come back with one command.
+
+Nothing leaves your machine unless you point a backend at a remote endpoint.
+
+* How it works
+
+1. =M-x muesli-capture= creates a meeting heading (=*** [2026-11-13 Fri] Title= under =* Meetings= / =** Category=) and gives it an =:ID:=.
+2. =M-x muesli-start= with point in that heading starts recording. The heading gets a =recording= tag and the mode line shows =●REC 12:34=. Keep typing notes.
+3. Audio is recorded in 30 s chunks. Each finished chunk is transcribed in the background. =M-x muesli-show-transcript= shows the transcript as it grows.
+4. =M-x muesli-stop= (from any buffer) finishes the recording and runs the pipeline:
+   =transcribing → diarizing → summarizing → done= (or =failed=). The mode line shows the current step.
+5. The heading body is replaced, as one undoable change, by the generated notes: summary, key points, decisions, action items as checkboxes, and open questions.
+
+| Command                      | What it does                                                         |
+|------------------------------+----------------------------------------------------------------------|
+| =muesli-capture=             | Capture a meeting heading into =muesli-meetings-file=                |
+| =muesli-start=               | Start recording the meeting at point (=C-u= asks for the mode)       |
+| =muesli-stop=                | Stop and process the recording                                       |
+| =muesli-abort=               | Stop and discard the audio and transcript                            |
+| =muesli-show-transcript=     | Live transcript buffer                                               |
+| =muesli-name-speakers=       | Name detected speakers again, then optionally regenerate             |
+| =muesli-regenerate=          | Summarize again from the stored notes and transcript                 |
+| =muesli-restore-notes=       | Put your original notes back                                         |
+| =muesli-resume=              | Retry a failed or interrupted step (=C-u= skips it)                  |
+| =muesli-select-device=       | Pick the microphone or system source (=C-u= sets it for one mode only) |
+| =muesli-delete-meeting-data= | Delete a meeting's rows and audio (the org heading stays)            |
+
+If Emacs exits mid-meeting, the next load offers to resume from whatever chunks are on disk.
+
+* Requirements
+
+- Emacs 29.1 or newer, built with SQLite (=(sqlite-available-p)= returns =t=).
+- =ffmpeg= and =curl=.
+- Linux with PipeWire or PulseAudio (=pactl= is used to find the monitor source for system audio). Other platforms only need a preset in =muesli-recorder-command=.
+- A speech-to-text server with an OpenAI-compatible =/v1/audio/transcriptions= endpoint, for example [[https://localai.io][LocalAI]] serving Parakeet.
+- An LLM: any OpenAI-compatible chat server (Ollama, llama.cpp, LocalAI, vLLM), the =claude= CLI, or an agent-shell agent.
+
+* Installation
+
+#+begin_src emacs-lisp
+(use-package muesli
+  :ensure (:host github :repo "zauberen/muesliel")  ; elpaca; or :load-path "~/Documents/GitHub/muesliel"
+  :commands (muesli-capture muesli-start muesli-stop muesli-show-transcript)
+  :bind (("C-c m c" . muesli-capture)
+         ("C-c m s" . muesli-start)
+         ("C-c m q" . muesli-stop)
+         ("C-c m t" . muesli-show-transcript))
+  :custom
+  (muesli-meetings-file org-meetings-file)          ; or (expand-file-name "meetings.org" org-directory)
+  (muesli-stt-base-url "http://localhost:8080/v1")
+  (muesli-stt-model "parakeet-tdt-0.6b-v3")
+  (muesli-diarization-backend 'localai)
+  (muesli-diarization-model "parakeet-cpp-nemotron-3-diarization")
+  (muesli-summary-backend 'openai)
+  (muesli-llm-base-url "http://localhost:11434/v1")
+  (muesli-llm-model "qwen3:14b"))
+#+end_src
+
+Your old =("m" "Meeting" ...)= capture template keeps working, but =muesli-capture= uses its own copy, which also adds the =:ID:=. To use muesli's from the regular capture menu, add =(car (muesli-capture-templates))= to =org-capture-templates=.
+
+* Capture modes
+
+| Mode     | Tracks                  | Speakers                                                              |
+|----------+-------------------------+-----------------------------------------------------------------------|
+| =room=   | microphone              | Diarization model on the mic track. No labels without one.            |
+| =call=   | microphone + system out | The mic is you (=muesli-user-name=). The system track is diarized, or labeled "Others". |
+| =hybrid= | microphone + system out | Both tracks diarized (a conference room with remote attendees).       |
+
+=room= is the default (=muesli-default-mode=). Set it per meeting with =C-u M-x muesli-start= or a =:MUESLI_MODE: call= property. Both tracks come from one ffmpeg process, so they stay time-aligned.
+
+Devices can be set per mode, for example an external omnidirectional mic in the conference room:
+
+#+begin_src emacs-lisp
+(setq muesli-input-device
+      '((room . "alsa_input.usb-My_Conference_Mic-00.mono-fallback")
+        (t . "default")))
+#+end_src
+
+=M-x muesli-select-device= lists the sources (=pactl list short sources=) with completion. =muesli-system-device= defaults to the monitor of the default output sink, resolved when recording starts.
+
+* Speakers
+
+Put attendees on the heading to help diarization and naming:
+
+#+begin_src org
+,*** [2026-11-13 Fri] Weekly planning
+:PROPERTIES:
+:ATTENDEES: Ann, Bob, Carla
+:END:
+#+end_src
+
+The number of attendees is sent as =num_speakers=. After diarization muesli shows two or three sample lines per detected speaker and asks for a name, completing over the attendees and names used before. An empty answer keeps "Speaker 1". You can rename later with =M-x muesli-name-speakers=, then =muesli-regenerate=. Set =muesli-skip-naming= to skip the prompts.
+
+Speaker labels from a single far-field microphone are approximate. The default prompt tells the model to attribute statements and action items only when the notes or the content make it clear.
+
+* Sample local speech server (LocalAI)
+
+LocalAI serves both Parakeet transcription and the =/v1/audio/diarization= endpoint, so one server covers both. A minimal container (add =--gpus all= and a CUDA image tag if you have an NVIDIA GPU):
+
+#+begin_src sh
+docker run -d --name local-ai -p 8080:8080 \
+  -v ~/.local/share/localai/models:/models \
+  localai/localai:latest
+#+end_src
+
+Then install models from the gallery. Names change between releases, so check the gallery in the web UI at http://localhost:8080 or with =curl localhost:8080/models/available=. When this README was written the diarization models included:
+
+#+begin_src sh
+# speaker turns only (what muesli needs, since it transcribes separately)
+curl localhost:8080/models/apply -H 'Content-Type: application/json' \
+  -d '{"id": "localai@parakeet-cpp-nemotron-3-diarization"}'
+#+end_src
+
+Install a Parakeet transcription model the same way, and set =muesli-stt-model= and =muesli-diarization-model= to the names listed by =curl localhost:8080/v1/models=. To check transcription by hand:
+
+#+begin_src sh
+curl localhost:8080/v1/audio/transcriptions \
+  -F file=@test.wav -F model=parakeet-tdt-0.6b-v3 -F response_format=verbose_json
+#+end_src
+
+If your server rejects the =timestamp_granularities[]= fields muesli sends, set =muesli-stt-extra-fields= to =nil=. Servers that return no =segments= still work: each chunk then becomes one segment.
+
+** Other diarization servers
+
+- =diarized-json=: servers that accept =response_format=diarized_json= on =/audio/transcriptions= (OpenAI's =gpt-4o-transcribe-diarize=, some compatible servers).
+- A function: =(lambda (file num-speakers callback) ...)= that calls =callback= once with =(:ok ((LABEL START-MS END-MS) ...))= or =(:error MESSAGE)=.
+
+* Summary backends
+
+| =muesli-summary-backend= | Notes                                                                                     |
+|--------------------------+-------------------------------------------------------------------------------------------|
+| =openai=                 | =POST {muesli-llm-base-url}/chat/completions=, non-streaming. Key: =muesli-llm-api-key=.  |
+| =claude-code=            | Runs =claude -p= in an empty temp directory with all tools, MCP servers and settings disabled. |
+| =agent-shell=            | Talks ACP to an agent from your agent-shell config (=muesli-agent-shell-config=, e.g. ='opencode=). Permission requests are refused and the session runs in an empty temp directory. |
+| a function               | =(lambda (prompt callback) ...)=, callback gets =(:ok TEXT)= or =(:error MESSAGE)=.       |
+
+The LLM only returns text. muesli edits the buffer itself: it strips code fences and preambles, shifts headings to one level below the meeting, and replaces the body. If you keep typing while the summary runs, muesli notices and runs the summary again on your updated notes rather than discarding your edits.
+
+API keys (=muesli-stt-api-key=, =muesli-llm-api-key=) may be functions, so =auth-source= works:
+
+#+begin_src emacs-lisp
+(setq muesli-llm-api-key
+      (lambda () (auth-source-pick-first-password :host "api.example.com")))
+#+end_src
+
+Keys go to curl through a private config file, never on the command line.
+
+Other options worth knowing: =muesli-action-item-style= (=checkbox= or =todo=), =muesli-append-transcript= (adds a folded =:TRANSCRIPT:= drawer), =muesli-done-tag=, =muesli-keep-audio=, =muesli-summary-max-chars= (longer meetings are summarized in sections first), and =muesli-summary-prompt=. =M-x customize-group RET muesli= lists them all.
+
+* Storage
+
+Everything lives in =muesli-database-file= (SQLite, default =$XDG_DATA_HOME/muesli/muesli.sqlite=): meetings, the chunk queue, transcript segments and speakers. Audio is written under =muesli-audio-directory= and deleted after a successful summary unless =muesli-keep-audio= is set. =*muesli-log*= has diagnostics.
+
+* Known limitations
+
+- Fixed-length chunks can split a word at a boundary. Chunking is isolated in =muesli-record--complete-chunks= and =muesli-record-chunk-offset-ms= so an overlap or VAD strategy can replace it later.
+- Only a Linux (PulseAudio/PipeWire) recorder preset ships for now.
+- No calendar integration, cross-meeting search, or voice enrollment yet.
+
+* Development
+
+#+begin_src sh
+make compile   # byte-compile, warnings are errors
+make checkdoc
+make test      # ERT, no audio hardware or network needed
+MUESLI_TEST_STT_URL=http://localhost:8080/v1 make test   # also hits a real STT server
+#+end_src
