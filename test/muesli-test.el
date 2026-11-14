@@ -196,6 +196,30 @@ STORED-TITLE)."
   (should (equal (muesli-record-parse-chunk-name "system-00001.wav") '("system" . 1)))
   (should-not (muesli-record-parse-chunk-name "mic-full.wav")))
 
+;;;; Levels and duration
+
+(ert-deftest muesli-peak-db-detects-silence-and-sound ()
+  (skip-unless (executable-find "ffmpeg"))
+  (let ((silent (make-temp-file "muesli-" nil ".wav"))
+        (tone (make-temp-file "muesli-" nil ".wav"))
+        (results '()))
+    (unwind-protect
+        (progn
+          (muesli-test-write-wav silent 1000)
+          (call-process "ffmpeg" nil nil nil "-v" "error" "-y" "-f" "lavfi"
+                        "-i" "sine=frequency=440:duration=1" "-ar" "16000" "-ac" "1" tone)
+          (muesli-record-peak-db silent (lambda (db) (push (cons 'silent db) results)))
+          (muesli-record-peak-db tone (lambda (db) (push (cons 'tone db) results)))
+          (should (muesli-test-wait (lambda () (= (length results) 2)) 10))
+          (should (< (alist-get 'silent results) muesli-silence-threshold-db))
+          (should (> (alist-get 'tone results) muesli-silence-threshold-db)))
+      (delete-file silent)
+      (delete-file tone))))
+
+(ert-deftest muesli-duration-has-seconds ()
+  (should (equal (muesli--duration-string '(:started_at 100 :ended_at 247)) "0:02:27"))
+  (should (equal (muesli--duration-string '(:started_at 0 :ended_at 3725)) "1:02:05")))
+
 ;;;; Transcription
 
 (ert-deftest muesli-stt-parse-segments-and-fallback ()
@@ -512,7 +536,7 @@ sibling body
         (goto-char (point-min))
         (re-search-forward "Weekly")
         (should (equal (org-get-tags nil t) '("work" "muesli")))
-        (should (equal (org-entry-get nil "MUESLI_DURATION") "0:00"))
+        (should (string-match-p "\\`0:00:[0-9][0-9]\\'" (org-entry-get nil "MUESLI_DURATION")))
         (let ((body (muesli-org-body)))
           (should (string-prefix-p "**** Summary\nAll good.\n\n:TRANSCRIPT:\n" body))
           (should (string-search "Speaker 2: second mic-00000" body)))

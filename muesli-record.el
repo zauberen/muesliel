@@ -118,6 +118,45 @@ the directory as TRACK-NNNNN.wav."
   (when-let* ((sink (car (muesli-record--pactl "get-default-sink"))))
     (concat (string-trim sink) ".monitor")))
 
+(defun muesli-record-source-muted-p (device)
+  "Return non-nil if PulseAudio/PipeWire source DEVICE is muted.
+DEVICE \"default\" means the default source.  Returns nil when pactl
+is unavailable or the answer is unknown."
+  (let ((line (car (muesli-record--pactl
+                    "get-source-mute"
+                    (if (member device '(nil "default")) "@DEFAULT_SOURCE@" device)))))
+    (and line (string-match-p "\\`Mute: *yes" (string-trim line)))))
+
+(defun muesli-record-describe-device (device)
+  "Return DEVICE with the actual default source name when it is \"default\"."
+  (if (member device '(nil "default"))
+      (format "default (%s)"
+              (or (car (muesli-record--pactl "get-default-source")) "unknown"))
+    device))
+
+(defcustom muesli-silence-threshold-db -50
+  "Peak level in dB below which a recorded chunk counts as silent.
+The first chunk of each track is checked; a silent one triggers a
+warning, which usually means a muted or wrong input device."
+  :type 'number
+  :group 'muesli)
+
+(defun muesli-record-peak-db (file callback)
+  "Measure the peak level of FILE with ffmpeg and call CALLBACK.
+CALLBACK receives the max volume in dB as a number, or nil if it
+could not be measured.  Runs asynchronously."
+  (muesli--run
+   :name "volumedetect"
+   :command (list muesli-ffmpeg-command "-hide_banner" "-nostats" "-i" file
+                  "-af" "volumedetect" "-f" "null" "-")
+   :callback (lambda (_code _out err)
+               (funcall callback
+                        (cond
+                         ((string-match "max_volume: *\\(-?[0-9.]+\\) dB" err)
+                          (string-to-number (match-string 1 err)))
+                         ((string-match-p "max_volume: *-inf" err) -1000)
+                         (t nil))))))
+
 (defun muesli-record-sources ()
   "Return the names of available PulseAudio/PipeWire sources."
   (delq nil (mapcar (lambda (line) (nth 1 (split-string line "\t")))

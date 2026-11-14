@@ -303,9 +303,34 @@ from an org buffer or an active capture buffer."
                                         (muesli--on-chunk id track no path))))))
         (muesli--set-tag muesli-recording-tag t)
         (muesli--mode-line-setup)
-        (setq muesli--mode-line-timer (run-at-time 1 1 #'force-mode-line-update))
+        ;; Refresh every window's mode line, not just the current buffer's.
+        (setq muesli--mode-line-timer
+              (run-at-time 1 1 (lambda () (force-mode-line-update t))))
         (muesli--message "Recording \"%s\" (%s mode: %s)" (plist-get info :title) mode
-                         (mapconcat (lambda (tr) (format "%s=%s" (car tr) (cdr tr))) tracks ", "))))))
+                         (mapconcat (lambda (tr) (format "%s=%s" (car tr)
+                                                         (muesli-record-describe-device (cdr tr))))
+                                    tracks ", "))
+        (dolist (tr tracks)
+          (when (muesli-record-source-muted-p (cdr tr))
+            (display-warning
+             'muesli
+             (format "The %s input %s is MUTED; the recording will be silent.  Unmute it, or pick another source with `muesli-select-device'."
+                     (car tr) (muesli-record-describe-device (cdr tr)))
+             :error)))))))
+
+(defun muesli--check-chunk-level (id track path)
+  "Warn if the first chunk of TRACK at PATH in meeting ID is silent."
+  (muesli-record-peak-db
+   path
+   (lambda (db)
+     (when (and db (< db muesli-silence-threshold-db)
+                (equal (plist-get muesli--recording :id) id))
+       (display-warning
+        'muesli
+        (format "The first %ds of the %s track are silent (peak %s dB).  Check that the input is not muted and is the microphone you are using (`muesli-select-device')."
+                (/ (or (muesli-record-wav-duration-ms path) 0) 1000) track
+                (if (<= db -1000) "-inf" (number-to-string db)))
+        :warning)))))
 
 (defun muesli--on-chunk (id track no path)
   "Register finished chunk NO of TRACK at PATH for meeting ID and queue it."
@@ -320,6 +345,8 @@ from an org buffer or an active capture buffer."
       (if (and duration (< duration 200))
           (muesli--log "Skipping near-empty chunk %s" path)
         (when (muesli-db-chunk-add id track no path offset duration)
+          (when (= no 0)
+            (ignore-errors (muesli--check-chunk-level id track path)))
           (muesli-stt-run-queue))))))
 
 (defun muesli--recorder-exited (id event)
@@ -563,11 +590,11 @@ ATTENDEES are offered as names."
 ;;;;; Summarizing
 
 (defun muesli--duration-string (meeting)
-  "Return MEETING's duration as H:MM, or nil."
+  "Return MEETING's duration as H:MM:SS, or nil."
   (when-let* ((start (plist-get meeting :started_at))
               (end (plist-get meeting :ended_at)))
-    (let ((minutes (/ (- end start) 60)))
-      (format "%d:%02d" (/ minutes 60) (% minutes 60)))))
+    (let ((s (max 0 (- end start))))
+      (format "%d:%02d:%02d" (/ s 3600) (/ (% s 3600) 60) (% s 60)))))
 
 (defun muesli--step-summarize (id &optional regenerate reruns)
   "Summarize meeting ID and replace its heading body.
@@ -590,6 +617,12 @@ RERUNS counts restarts caused by notes edited during summarization."
                          info)))
       (muesli--log "Summarizing \"%s\" (%d chars of notes, %d of transcript)"
                    (plist-get info :title) (length notes) (length transcript))
+      (when (and (string-empty-p transcript) (muesli-db-chunks id))
+        (display-warning
+         'muesli
+         (format "No speech was transcribed from %d recorded chunk(s) of \"%s\"; the notes will be based on your typed notes only.  The input may have been muted or the wrong device (see *muesli-log*).  Set `muesli-keep-audio' to keep the audio for checking."
+                 (length (muesli-db-chunks id)) (plist-get info :title))
+         :warning))
       (muesli-summary-generate
        info notes transcript
        (lambda (result)
