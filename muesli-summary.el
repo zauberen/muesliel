@@ -134,6 +134,8 @@ Rules:
 - Every heading must start with exactly %L stars (level %l); sub-points under a heading are plain org lists, or headings with more stars.
 
 Structure, omitting any section that would be empty:
+%S Participants
+An org description list with one item per person who spoke, in the form \"- Name :: one short sentence on what they talked about\". Use the speaker names from the transcript; when a label is generic (\"Speaker 2\") keep it unless the notes or the conversation make clear who it is. If the transcript has no speaker labels, list only people the notes or the conversation identify as speaking. Do not list attendees who did not speak, and do not invent people.
 %S Summary
 A short paragraph.
 %S Key points

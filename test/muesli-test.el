@@ -378,6 +378,8 @@ STORED-TITLE)."
     (should (string-search "my notes 100%" p))
     (should (string-search "A, B" p))
     (should (string-search "**** Summary" p))
+    (should (string-search "**** Participants" p))
+    (should (string-search "- Name :: " p))
     (should (string-search "[00:00] A: hi" p))))
 
 (ert-deftest muesli-summary-long-meeting-sections ()

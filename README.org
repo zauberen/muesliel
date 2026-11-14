@@ -7,11 +7,11 @@ Nothing leaves your machine unless you point a backend at a remote endpoint.
 * How it works
 
 1. =M-x muesli-capture= creates a meeting heading (=*** [2026-11-13 Fri] Title= under =* Meetings= / =** Category=) and gives it an =:ID:=.
-2. =M-x muesli-start= with point in that heading starts recording. The heading gets a =recording= tag and the mode line shows =●REC 12:34=. Keep typing notes.
+2. =M-x muesli-start= with point in that heading starts recording. The heading gets a =recording= tag and the mode line shows =• REC 12:34= (=muesli-mode-line-recording-format=). Keep typing notes.
 3. Audio is recorded in 30 s chunks. Each finished chunk is transcribed in the background. =M-x muesli-show-transcript= shows the transcript as it grows.
 4. =M-x muesli-stop= (from any buffer) finishes the recording and runs the pipeline:
    =transcribing → diarizing → summarizing → done= (or =failed=). The mode line shows the current step.
-5. The heading body is replaced, as one undoable change, by the generated notes: summary, key points, decisions, action items as checkboxes, and open questions.
+5. The heading body is replaced, as one undoable change, by the generated notes: participants (=- Name :: what they talked about=), summary, key points, decisions, action items as checkboxes, and open questions.
 
 | Command                      | What it does                                                         |
 |------------------------------+----------------------------------------------------------------------|

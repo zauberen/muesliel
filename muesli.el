@@ -64,6 +64,13 @@ A MUESLI_MODE property on the heading overrides this."
   :type '(choice (const room) (const call) (const hybrid))
   :group 'muesli)
 
+(defcustom muesli-mode-line-recording-format "• REC %s"
+  "Mode line text while recording; %s is replaced by the elapsed time.
+The default uses U+2022 BULLET, which most fonts center at text
+height; U+25CF BLACK CIRCLE sits on the baseline in many fonts."
+  :type 'string
+  :group 'muesli)
+
 (defcustom muesli-recording-tag "recording"
   "Tag added to a meeting heading while it is being recorded."
   :type 'string
@@ -110,7 +117,7 @@ Keys: :id :title :mode :stop :watch-stop :started :dir :exited
   (let ((parts '()))
     (when muesli--recording
       (push (propertize
-             (format "●REC %s"
+             (format muesli-mode-line-recording-format
                      (muesli--format-clock
                       (* 1000 (- (float-time) (plist-get muesli--recording :started)))))
              'face 'error
